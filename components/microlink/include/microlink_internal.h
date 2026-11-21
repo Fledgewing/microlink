@@ -722,6 +722,35 @@ void ml_net_io_task(void *arg);
 
 /* ml_derp.c */
 void ml_derp_tx_task(void *arg);
+
+/* The DERP I/O task's loop, in steps, so ML_LITE_TASKS can run it in the
+ * same task as the WireGuard manager (ml_tunnel_task). DERP task only. */
+typedef struct {
+    uint32_t frames_rx;
+    uint32_t frames_tx;
+    uint64_t last_status_ms;
+    uint32_t loop_count;
+    uint64_t last_heartbeat_ms;
+    uint64_t connected_since_ms;
+    bool verbose_phase;         /* verbose logging for first 15s after connect */
+} ml_derp_io_t;
+
+typedef enum {
+    ML_DERP_STEP_IDLE,          /* done: wait for work (ml_derp_idle_wait) */
+    ML_DERP_STEP_AGAIN,         /* connection just failed: step again at once */
+    ML_DERP_STEP_DISCONNECTED,  /* no connection: poll again in ~100 ms */
+} ml_derp_step_t;
+
+void ml_derp_io_begin(microlink_t *ml, ml_derp_io_t *io);
+/* Handle connect/reconnect requests, send queued packets, read what has
+ * arrived. Blocks only while (re)connecting. */
+ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io);
+/* Block up to max_ms until DERP data or a ml_derp_queue_send() wakeup
+ * (with ML_LITE_TASKS also a ml_wg_mgr_wake()). Returns at once if there is
+ * pending work. */
+void ml_derp_idle_wait(microlink_t *ml, uint32_t max_ms);
+/* Close every DERP connection and drop queued packets (at task exit). */
+void ml_derp_io_end(microlink_t *ml);
 esp_err_t ml_derp_connect(microlink_t *ml);
 /* ml_stun.c: probe every relay region over STUN and set derp_preferred_region
  * (and derp_home_region) to the fastest. Blocks up to ~1.5 s. */

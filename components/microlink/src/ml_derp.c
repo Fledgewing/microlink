@@ -530,7 +530,7 @@ static void derp_wake_init(microlink_t *ml) {
     ml->derp_wake_fd = fd;
 }
 
-static void derp_idle_wait(microlink_t *ml) {
+void ml_derp_idle_wait(microlink_t *ml, uint32_t max_ms) {
     if (uxQueueMessagesWaiting(ml->derp_tx_queue) > 0) return;
     if (ml->derp.connected && mbedtls_ssl_get_bytes_avail(&ml->derp.ssl) > 0) return;
     for (int i = 0; i < ML_DERP_EXTRA_CONNS; i++) {
@@ -553,7 +553,7 @@ static void derp_idle_wait(microlink_t *ml) {
                 if (xfd > maxfd) maxfd = xfd;
             }
         }
-        struct timeval tv = { .tv_sec = 0, .tv_usec = DERP_IDLE_WAIT_MS * 1000 };
+        struct timeval tv = { .tv_sec = 0, .tv_usec = max_ms * 1000 };
         int n = select(maxfd + 1, &rfds, NULL, NULL, &tv);
         if (n > 0 && FD_ISSET(wfd, &rfds)) {
             uint64_t v;
@@ -563,7 +563,8 @@ static void derp_idle_wait(microlink_t *ml) {
         }
     } else {
         ml_derp_tx_item_t peek;
-        (void)xQueuePeek(ml->derp_tx_queue, &peek, pdMS_TO_TICKS(DERP_AT_POLL_MS));
+        (void)xQueuePeek(ml->derp_tx_queue, &peek,
+                         pdMS_TO_TICKS(max_ms < DERP_AT_POLL_MS ? max_ms : DERP_AT_POLL_MS));
     }
 }
 
@@ -682,203 +683,216 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
  * Unified DERP I/O Task
  * ========================================================================== */
 
-void ml_derp_tx_task(void *arg) {
-    microlink_t *ml = (microlink_t *)arg;
-    ESP_LOGI(TAG, "DERP I/O task started (Core %d)", xPortGetCoreID());
+void ml_derp_io_begin(microlink_t *ml, ml_derp_io_t *io) {
+    memset(io, 0, sizeof(*io));
     derp_wake_init(ml);
+}
 
-    uint32_t frames_rx = 0;
-    uint32_t frames_tx = 0;
-    uint64_t last_status_ms = 0;
-    uint32_t loop_count = 0;
-    uint64_t last_heartbeat_ms = 0;
-    uint64_t connected_since_ms = 0;
-    bool verbose_phase = false;  /* verbose logging for first 15s after connect */
+ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
+    io->loop_count++;
+    uint64_t loop_start = ml_get_time_ms();
 
-    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
-        loop_count++;
-        uint64_t loop_start = ml_get_time_ms();
-
-        /* Unconditional heartbeat - proves task is alive */
-        if (loop_start - last_heartbeat_ms > 5000) {
-            ESP_LOGD(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
-                     (unsigned long)loop_count, ml->derp.connected,
-                     (unsigned long)frames_rx, (unsigned long)frames_tx,
-                     (unsigned long)uxTaskGetStackHighWaterMark(NULL));
-            last_heartbeat_ms = loop_start;
-        }
-
-        /* ---- Periodic status logging (always, even when disconnected) ---- */
-        {
-            uint64_t now_ms = loop_start;
-            if (now_ms - last_status_ms > 10000) {
-                ESP_LOGD(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
-                         ml->derp.connected, ml->derp.sockfd,
-                         (unsigned long)frames_rx, (unsigned long)frames_tx,
-                         (unsigned long)loop_count);
-                last_status_ms = now_ms;
-            }
-        }
-
-        /* ---- Handle DERP connect request from coord task ---- */
-        {
-            EventBits_t bits = xEventGroupGetBits(ml->events);
-            /* Always consume a connect request. One that arrives while we
-             * are connected (or reconnecting) is already satisfied; left
-             * set, it would fire after the next read/write error and run a
-             * connect over the failed, not yet freed session. A pending
-             * RECONNECT does the full disconnect + connect itself. */
-            if (bits & ML_EVT_DERP_CONNECT_REQ) {
-                xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
-            }
-            if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected &&
-                !(bits & ML_EVT_DERP_RECONNECT)) {
-                /* Retry up to 3 times with 2s backoff */
-                for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
-                    if (attempt > 0) {
-                        ESP_LOGW(TAG, "DERP connect retry %d/3 in 2s...", attempt + 1);
-                        vTaskDelay(pdMS_TO_TICKS(2000));
-                    } else {
-                        ESP_LOGI(TAG, "DERP connect requested, connecting from I/O task");
-                    }
-                    /* Each attempt can cost a DNS timeout plus a 20 s TLS
-                     * handshake; don't start one that stop will discard. */
-                    if (ml_shutdown_requested(ml)) break;
-                    if (ml_derp_connect(ml) == ESP_OK) {
-                        connected_since_ms = ml_get_time_ms();
-                        verbose_phase = true;
-                        break;
-                    }
-                    ESP_LOGW(TAG, "DERP connect attempt %d failed", attempt + 1);
-                }
-            }
-            if (bits & ML_EVT_DERP_RECONNECT) {
-                xEventGroupClearBits(ml->events, ML_EVT_DERP_RECONNECT);
-                ESP_LOGW(TAG, "DERP reconnect requested (was %s)",
-                         ml->derp.connected ? "connected" : "disconnected");
-                ml_derp_disconnect(ml);
-                verbose_phase = false;
-                /* Auto-reconnect after disconnect */
-                vTaskDelay(pdMS_TO_TICKS(1000));
-                for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
-                    if (attempt > 0) {
-                        ESP_LOGW(TAG, "DERP reconnect retry %d/3 in 2s...", attempt + 1);
-                        vTaskDelay(pdMS_TO_TICKS(2000));
-                    }
-                    if (ml_shutdown_requested(ml)) break;
-                    if (ml_derp_connect(ml) == ESP_OK) {
-                        connected_since_ms = ml_get_time_ms();
-                        verbose_phase = true;
-                        break;
-                    }
-                    ESP_LOGW(TAG, "DERP reconnect attempt %d failed", attempt + 1);
-                }
-            }
-        }
-
-        /* Disable verbose logging after 15s */
-        if (verbose_phase && ml_get_time_ms() - connected_since_ms > 15000) {
-            verbose_phase = false;
-        }
-
-        if (!ml->derp.connected) {
-            /* Not connected - just wait and check again */
-            vTaskDelay(pdMS_TO_TICKS(100));
-            continue;
-        }
-
-        /* ---- Phase 1: Drain TX queue FIRST (prioritize outgoing) ---- */
-        {
-            for (int tx_count = 0; tx_count < 8; tx_count++) {
-                ml_derp_tx_item_t item;
-                if (xQueueReceive(ml->derp_tx_queue, &item, 0) != pdTRUE) {
-                    break;
-                }
-                if (!ml->derp.connected) {
-                    free(item.data);
-                    continue;
-                }
-                int ret;
-                ml_derp_conn_t *c = &ml->derp;
-                if (item.frame_type == DERP_FRAME_SEND_PACKET) {
-                    c = derp_conn_for_region(ml, item.region);
-                    ESP_LOGD(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x, region=%d",
-                             (int)item.len, item.dest_pubkey[0], item.dest_pubkey[1],
-                             item.dest_pubkey[2], item.dest_pubkey[3],
-                             item.data[0], c->region);
-                    ret = derp_send_packet(c, item.dest_pubkey, item.data, item.len);
-                } else {
-                    ret = derp_write_frame(c, item.frame_type, item.data, item.len);
-                }
-                if (ret < 0 && c != &ml->derp) {
-                    ESP_LOGW(TAG, "DERP region %d write failed; closing it", c->region);
-                    derp_conn_close(c);
-                } else if (ret < 0) {
-                    ESP_LOGW(TAG, "DERP write failed");
-                    ml->derp.connected = false;
-                    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
-                } else {
-                    frames_tx++;
-                }
-                free(item.data);
-            }
-        }
-
-        if (!ml->derp.connected) continue;
-
-        /* ---- Phase 2: Poll for incoming DERP frames ---- */
-        {
-            int burst;
-            for (burst = 0; burst < 4; burst++) {
-                int ret = poll_derp_read(ml, &ml->derp);
-                if (ret > 0) {
-                    frames_rx++;
-                    ml->derp.last_recv_ms = ml_get_time_ms();
-                } else if (ret == 0) {
-                    break;  /* No more data / timeout */
-                } else {
-                    ESP_LOGW(TAG, "DERP read error: %d", ret);
-                    ml->derp.connected = false;
-                    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
-                    break;
-                }
-            }
-        }
-
-        /* ---- Phase 3: other peers' relay regions ---- */
-        for (int i = 0; i < ML_DERP_EXTRA_CONNS; i++) {
-            ml_derp_conn_t *x = &ml->derp_extra[i];
-            if (!x->connected) continue;
-            for (int burst = 0; burst < 4; burst++) {
-                int ret = poll_derp_read(ml, x);
-                if (ret > 0) {
-                    frames_rx++;
-                    x->last_recv_ms = ml_get_time_ms();
-                } else if (ret == 0) {
-                    break;
-                } else {
-                    ESP_LOGW(TAG, "DERP region %d read error: %d; closing it", x->region, ret);
-                    derp_conn_close(x);
-                    break;
-                }
-            }
-            if (x->connected && ml_get_time_ms() - x->last_tx_ms > ML_DERP_EXTRA_IDLE_MS) {
-                ESP_LOGI(TAG, "DERP region %d idle; closing it", x->region);
-                derp_conn_close(x);
-            }
-        }
-
-        /* Block until there is work (incoming data, queued TX) or a timeout */
-        derp_idle_wait(ml);
+    /* Unconditional heartbeat - proves task is alive */
+    if (loop_start - io->last_heartbeat_ms > 5000) {
+        ESP_LOGD(TAG, "HEARTBEAT: loop=%lu conn=%d rx=%lu tx=%lu stack_free=%lu",
+                 (unsigned long)io->loop_count, ml->derp.connected,
+                 (unsigned long)io->frames_rx, (unsigned long)io->frames_tx,
+                 (unsigned long)uxTaskGetStackHighWaterMark(NULL));
+        io->last_heartbeat_ms = loop_start;
     }
 
+    /* ---- Periodic status logging (always, even when disconnected) ---- */
+    {
+        uint64_t now_ms = loop_start;
+        if (now_ms - io->last_status_ms > 10000) {
+            ESP_LOGD(TAG, "DERP status: connected=%d fd=%d rx=%lu tx=%lu loops=%lu",
+                     ml->derp.connected, ml->derp.sockfd,
+                     (unsigned long)io->frames_rx, (unsigned long)io->frames_tx,
+                     (unsigned long)io->loop_count);
+            io->last_status_ms = now_ms;
+        }
+    }
+
+    /* ---- Handle DERP connect request from coord task ---- */
+    {
+        EventBits_t bits = xEventGroupGetBits(ml->events);
+        /* Always consume a connect request. One that arrives while we
+         * are connected (or reconnecting) is already satisfied; left
+         * set, it would fire after the next read/write error and run a
+         * connect over the failed, not yet freed session. A pending
+         * RECONNECT does the full disconnect + connect itself. */
+        if (bits & ML_EVT_DERP_CONNECT_REQ) {
+            xEventGroupClearBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
+        }
+        if ((bits & ML_EVT_DERP_CONNECT_REQ) && !ml->derp.connected &&
+            !(bits & ML_EVT_DERP_RECONNECT)) {
+            /* Retry up to 3 times with 2s backoff */
+            for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
+                if (attempt > 0) {
+                    ESP_LOGW(TAG, "DERP connect retry %d/3 in 2s...", attempt + 1);
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                } else {
+                    ESP_LOGI(TAG, "DERP connect requested, connecting from I/O task");
+                }
+                /* Each attempt can cost a DNS timeout plus a 20 s TLS
+                 * handshake; don't start one that stop will discard. */
+                if (ml_shutdown_requested(ml)) break;
+                if (ml_derp_connect(ml) == ESP_OK) {
+                    io->connected_since_ms = ml_get_time_ms();
+                    io->verbose_phase = true;
+                    break;
+                }
+                ESP_LOGW(TAG, "DERP connect attempt %d failed", attempt + 1);
+            }
+        }
+        if (bits & ML_EVT_DERP_RECONNECT) {
+            xEventGroupClearBits(ml->events, ML_EVT_DERP_RECONNECT);
+            ESP_LOGW(TAG, "DERP reconnect requested (was %s)",
+                     ml->derp.connected ? "connected" : "disconnected");
+            ml_derp_disconnect(ml);
+            io->verbose_phase = false;
+            /* Auto-reconnect after disconnect */
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            for (int attempt = 0; attempt < 3 && !ml->derp.connected; attempt++) {
+                if (attempt > 0) {
+                    ESP_LOGW(TAG, "DERP reconnect retry %d/3 in 2s...", attempt + 1);
+                    vTaskDelay(pdMS_TO_TICKS(2000));
+                }
+                if (ml_shutdown_requested(ml)) break;
+                if (ml_derp_connect(ml) == ESP_OK) {
+                    io->connected_since_ms = ml_get_time_ms();
+                    io->verbose_phase = true;
+                    break;
+                }
+                ESP_LOGW(TAG, "DERP reconnect attempt %d failed", attempt + 1);
+            }
+        }
+    }
+
+    /* Disable verbose logging after 15s */
+    if (io->verbose_phase && ml_get_time_ms() - io->connected_since_ms > 15000) {
+        io->verbose_phase = false;
+    }
+
+    if (!ml->derp.connected) {
+        return ML_DERP_STEP_DISCONNECTED;
+    }
+
+    /* ---- Phase 1: Drain TX queue FIRST (prioritize outgoing) ---- */
+    {
+        for (int tx_count = 0; tx_count < 8; tx_count++) {
+            ml_derp_tx_item_t item;
+            if (xQueueReceive(ml->derp_tx_queue, &item, 0) != pdTRUE) {
+                break;
+            }
+            if (!ml->derp.connected) {
+                free(item.data);
+                continue;
+            }
+            int ret;
+            ml_derp_conn_t *c = &ml->derp;
+            if (item.frame_type == DERP_FRAME_SEND_PACKET) {
+                c = derp_conn_for_region(ml, item.region);
+                ESP_LOGD(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x, region=%d",
+                         (int)item.len, item.dest_pubkey[0], item.dest_pubkey[1],
+                         item.dest_pubkey[2], item.dest_pubkey[3],
+                         item.data[0], c->region);
+                ret = derp_send_packet(c, item.dest_pubkey, item.data, item.len);
+            } else {
+                ret = derp_write_frame(c, item.frame_type, item.data, item.len);
+            }
+            if (ret < 0 && c != &ml->derp) {
+                ESP_LOGW(TAG, "DERP region %d write failed; closing it", c->region);
+                derp_conn_close(c);
+            } else if (ret < 0) {
+                ESP_LOGW(TAG, "DERP write failed");
+                ml->derp.connected = false;
+                xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+            } else {
+                io->frames_tx++;
+            }
+            free(item.data);
+        }
+    }
+
+    if (!ml->derp.connected) return ML_DERP_STEP_AGAIN;
+
+    /* ---- Phase 2: Poll for incoming DERP frames ---- */
+    {
+        int burst;
+        for (burst = 0; burst < 4; burst++) {
+            int ret = poll_derp_read(ml, &ml->derp);
+            if (ret > 0) {
+                io->frames_rx++;
+                ml->derp.last_recv_ms = ml_get_time_ms();
+            } else if (ret == 0) {
+                break;  /* No more data / timeout */
+            } else {
+                ESP_LOGW(TAG, "DERP read error: %d", ret);
+                ml->derp.connected = false;
+                xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+                break;
+            }
+        }
+    }
+
+    /* ---- Phase 3: other peers' relay regions ---- */
+    for (int i = 0; i < ML_DERP_EXTRA_CONNS; i++) {
+        ml_derp_conn_t *x = &ml->derp_extra[i];
+        if (!x->connected) continue;
+        for (int burst = 0; burst < 4; burst++) {
+            int ret = poll_derp_read(ml, x);
+            if (ret > 0) {
+                io->frames_rx++;
+                x->last_recv_ms = ml_get_time_ms();
+            } else if (ret == 0) {
+                break;
+            } else {
+                ESP_LOGW(TAG, "DERP region %d read error: %d; closing it", x->region, ret);
+                derp_conn_close(x);
+                break;
+            }
+        }
+        if (x->connected && ml_get_time_ms() - x->last_tx_ms > ML_DERP_EXTRA_IDLE_MS) {
+            ESP_LOGI(TAG, "DERP region %d idle; closing it", x->region);
+            derp_conn_close(x);
+        }
+    }
+
+    return ML_DERP_STEP_IDLE;
+}
+
+void ml_derp_io_end(microlink_t *ml) {
     /* Release the TLS session, the socket and any packets still queued for
      * TX. Nobody else may: the connection is owned by this task. */
     ML_HEAP_TRACE("derp_tx: exit begin");
     ml_derp_close_extras(ml);
     ml_derp_disconnect(ml);
     ML_HEAP_TRACE("derp_tx: TLS + socket freed");
+}
 
+void ml_derp_tx_task(void *arg) {
+    microlink_t *ml = (microlink_t *)arg;
+    ESP_LOGI(TAG, "DERP I/O task started (Core %d)", xPortGetCoreID());
+    ml_derp_io_t io;
+    ml_derp_io_begin(ml, &io);
+
+    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
+        switch (ml_derp_io_step(ml, &io)) {
+        case ML_DERP_STEP_DISCONNECTED:
+            /* Not connected - just wait and check again */
+            vTaskDelay(pdMS_TO_TICKS(100));
+            break;
+        case ML_DERP_STEP_AGAIN:
+            break;
+        case ML_DERP_STEP_IDLE:
+            /* Block until there is work (incoming data, queued TX) or a timeout */
+            ml_derp_idle_wait(ml, DERP_IDLE_WAIT_MS);
+            break;
+        }
+    }
+
+    ml_derp_io_end(ml);
     ESP_LOGI(TAG, "DERP I/O task exiting");
     ml_task_exit(ml, ML_TASK_BIT_DERP_TX);
 }
