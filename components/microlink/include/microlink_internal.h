@@ -855,6 +855,8 @@ typedef struct {
     uint32_t tx_drops;          /* derp_tx full: oldest or new packet dropped */
     uint32_t read_us;           /* in poll_derp_read for a frame (TLS read + decrypt) */
     uint32_t wg_us;             /* in process_wg_packet (WireGuard decrypt + lwIP input) */
+    uint32_t udp_rx_bytes;      /* WireGuard packets on the direct UDP path (net_io task) */
+    uint32_t udp_rx_drops;      /* direct packets dropped on a full wg_rx queue */
 } ml_derp_rate_t;
 extern ml_derp_rate_t ml_derp_rate;
 

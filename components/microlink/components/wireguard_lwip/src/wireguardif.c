@@ -575,11 +575,14 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 
 	// Packet is good — identify the peer
 	uint8_t wg_idx = wireguard_peer_index(device, peer);
-	ESP_LOGI(WG_TAG, "Handshake complete (initiator): wg_idx=%u key=%02x%02x%02x%02x via %s:%u, rtt %lu ms",
+	// "via" is where the response came from; the initiation went the way
+	// "sent" says, and the rtt covers both legs.
+	ESP_LOGI(WG_TAG, "Handshake complete (initiator): wg_idx=%u key=%02x%02x%02x%02x via %s:%u (sent via %s), rtt %lu ms",
 	       wg_idx,
 	       peer->public_key[0], peer->public_key[1],
 	       peer->public_key[2], peer->public_key[3],
-	       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port, (unsigned long)hs_rtt_ms);
+	       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port,
+	       peer->initiation_via_derp ? "DERP" : "direct", (unsigned long)hs_rtt_ms);
 	wireguardif_send_keepalive(device, peer);
 
 	// Set the IF-UP flag on netif
@@ -1106,6 +1109,7 @@ static err_t wireguard_start_handshake(struct netif *netif, struct wireguard_pee
 	}
 
 	wg_peer_dest_snapshot(peer, &dest);
+	peer->initiation_via_derp = ip_addr_isany(&dest.ip);
 	WG_DEBUG("[WG_TX] Starting handshake to %s:%u",
 		ip_addr_isany(&dest.ip) ? "DERP" : ipaddr_ntoa(&dest.ip), dest.port);
 

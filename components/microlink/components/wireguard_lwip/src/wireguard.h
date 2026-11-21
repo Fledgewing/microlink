@@ -200,6 +200,9 @@ struct wireguard_peer {
 	uint32_t last_initiation_rx;
 	// The last time we sent an initiation message to this peer
 	uint32_t last_initiation_tx;
+	// That initiation went over DERP (for the handshake log line: a response
+	// from a direct address then measured DERP one way, direct the other)
+	bool initiation_via_derp;
 
 	// last_tx and last_rx of data packets
 	uint32_t last_tx;

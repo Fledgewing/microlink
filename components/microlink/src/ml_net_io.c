@@ -88,7 +88,9 @@ static void route_udp_packet(microlink_t *ml, uint8_t *data, size_t len,
         }
         break;
     case PKT_WIREGUARD:
+        ml_derp_rate.udp_rx_bytes += len;
         if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
+            ml_derp_rate.udp_rx_drops++;
             free(data);
         } else {
             ml_wg_mgr_wake(ml);

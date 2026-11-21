@@ -1629,6 +1629,37 @@ static void process_disco_ping(microlink_t *ml, const ml_rx_packet_t *pkt,
     ESP_LOGD(TAG, "DISCO PING from %s (via %s)",
              p->hostname, pkt->via_derp ? "DERP" : "direct");
 
+    /* A direct ping from an address we do not know is a candidate endpoint,
+     * as in Tailscale's handlePingLocked (addCandidateEndpoint): the peer
+     * reached us from there, so ping it back. Without this a start on cached
+     * state (only two endpoints kept per peer, no control session) never
+     * probed the address the peer actually uses, and our side never saw a
+     * direct path even while WireGuard ran over it. */
+    if (!pkt->via_derp && !ml_at_socket_is_ready() && pkt->src_ip != 0 && pkt->src_port != 0 &&
+        wg_endpoint_ip4_is_valid_underlay(pkt->src_ip)) {
+        bool known = false;
+        for (int i = 0; i < p->endpoint_count && i < ML_MAX_ENDPOINTS; i++) {
+            if (!p->endpoints[i].is_ipv6 && p->endpoints[i].ip == pkt->src_ip &&
+                p->endpoints[i].port == pkt->src_port) {
+                known = true;
+                break;
+            }
+        }
+        if (!known) {
+            /* Full table: the newest slot gives way (MapResponse order puts
+             * the peer's preferred endpoints first). */
+            int slot = p->endpoint_count < ML_MAX_ENDPOINTS ? p->endpoint_count++ : ML_MAX_ENDPOINTS - 1;
+            p->endpoints[slot].ip = pkt->src_ip;
+            p->endpoints[slot].port = pkt->src_port;
+            p->endpoints[slot].is_ipv6 = false;
+            p->endpoints[slot].last_ping_ms = 0;
+            ESP_LOGI(TAG, "DISCO: %s pinged us from %d.%d.%d.%d:%d; probing it",
+                     p->hostname, (int)((pkt->src_ip >> 24) & 0xFF), (int)((pkt->src_ip >> 16) & 0xFF),
+                     (int)((pkt->src_ip >> 8) & 0xFF), (int)(pkt->src_ip & 0xFF), (int)pkt->src_port);
+            disco_ping_round(ml, peer_idx, false);
+        }
+    }
+
     /* Build PONG */
     uint8_t pong[256];
     size_t pong_len = 0;

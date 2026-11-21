@@ -1308,14 +1308,16 @@ ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
             /* Only while relayed traffic flows (more than keepalives). */
             uint32_t frx = io->frames_rx - io->rate_frames_rx;
             uint32_t ftx = io->frames_tx - io->rate_frames_tx;
-            if (frx + ftx > 20) {
+            if (frx + ftx > 20 || ml_derp_rate.udp_rx_bytes > 32 * 1024) {
                 ml_derp_rate_t r = ml_derp_rate;
                 memset(&ml_derp_rate, 0, sizeof(ml_derp_rate));
-                ESP_LOGI(TAG, "DERP rate 10 s: rx %lu frames %lu KB, tx %lu frames %lu KB, "
-                         "drops rx %lu tx %lu, busy: DERP read %lu ms, WireGuard %lu ms",
+                ESP_LOGI(TAG, "Tunnel rate 10 s: DERP rx %lu frames %lu KB, tx %lu frames %lu KB, "
+                         "direct rx %lu KB, drops DERP rx %lu tx %lu direct rx %lu, "
+                         "busy: DERP read %lu ms, WireGuard %lu ms",
                          (unsigned long)frx, (unsigned long)(r.rx_bytes / 1024),
                          (unsigned long)ftx, (unsigned long)(r.tx_bytes / 1024),
-                         (unsigned long)r.rx_drops, (unsigned long)r.tx_drops,
+                         (unsigned long)(r.udp_rx_bytes / 1024),
+                         (unsigned long)r.rx_drops, (unsigned long)r.tx_drops, (unsigned long)r.udp_rx_drops,
                          (unsigned long)(r.read_us / 1000), (unsigned long)(r.wg_us / 1000));
             } else {
                 memset(&ml_derp_rate, 0, sizeof(ml_derp_rate));
