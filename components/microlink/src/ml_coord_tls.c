@@ -13,10 +13,12 @@
  */
 
 #include "sdkconfig.h"
+#include "ml_coord_lite.h"
 
-#ifdef CONFIG_ML_CTRL_TLS
+#if defined(CONFIG_ML_CTRL_TLS) || ML_COORD_TLS_FALLBACK
 
 #include "microlink_internal.h"
+#include <stdlib.h>
 #include "esp_log.h"
 #include "mbedtls/error.h"
 #include "mbedtls/net_sockets.h"
@@ -32,6 +34,25 @@
 #include <string.h>
 
 static const char *TAG = "ml_coord_tls";
+
+#ifdef CONFIG_ML_CTRL_TLS
+/* Always TLS: the state lives in the context. */
+static ml_coord_tls_t *tls_of(microlink_t *ml) { return &ml->coord_tls; }
+#else
+/* ML_LITE_CONTROL_PLAIN fallback (port 443 after port 80 failed): the state
+ * is allocated by the handshake and freed with the connection, so it costs
+ * nothing while the control connection runs on port 80, which is almost
+ * always. One coord connection at a time per process (the coord task owns
+ * it); a second context's 443 fallback fails while one is open. */
+static ml_coord_tls_t *s_tls;
+static microlink_t *s_tls_owner;
+static ml_coord_tls_t *tls_of(microlink_t *ml) { return s_tls_owner == ml ? s_tls : NULL; }
+#endif
+
+bool ml_coord_tls_active(microlink_t *ml) {
+    ml_coord_tls_t *t = tls_of(ml);
+    return t && t->active;
+}
 
 /* BIO callbacks route through ml_send/ml_recv so the AT-socket backend
  * keeps working. SO_RCVTIMEO/SO_SNDTIMEO on the socket provide timeouts;
@@ -59,7 +80,18 @@ static int coord_bio_recv(void *ctx, unsigned char *buf, size_t len) {
 }
 
 int ml_coord_tls_handshake(microlink_t *ml, const char *hostname) {
-    ml_coord_tls_t *t = &ml->coord_tls;
+#ifdef CONFIG_ML_CTRL_TLS
+    ml_coord_tls_t *t = tls_of(ml);
+#else
+    if (s_tls) {
+        ESP_LOGE(TAG, "Control TLS session already in use by another context");
+        return -1;
+    }
+    ml_coord_tls_t *t = calloc(1, sizeof(*t));
+    if (!t) return -1;
+    s_tls = t;
+    s_tls_owner = ml;
+#endif
 
     mbedtls_ssl_init(&t->ssl);
     mbedtls_ssl_config_init(&t->ssl_conf);
@@ -137,8 +169,8 @@ fail:
 }
 
 int ml_coord_tls_send(microlink_t *ml, const uint8_t *data, size_t len) {
-    ml_coord_tls_t *t = &ml->coord_tls;
-    if (!t->active) { errno = ENOTCONN; return -1; }
+    ml_coord_tls_t *t = tls_of(ml);
+    if (!t || !t->active) { errno = ENOTCONN; return -1; }
 
     size_t sent = 0;
     while (sent < len) {
@@ -155,8 +187,8 @@ int ml_coord_tls_send(microlink_t *ml, const uint8_t *data, size_t len) {
 
 /* recv() semantics: >0 bytes read, 0 peer closed, -1 error (EAGAIN on timeout) */
 int ml_coord_tls_recv(microlink_t *ml, uint8_t *buf, size_t len) {
-    ml_coord_tls_t *t = &ml->coord_tls;
-    if (!t->active) { errno = ENOTCONN; return -1; }
+    ml_coord_tls_t *t = tls_of(ml);
+    if (!t || !t->active) { errno = ENOTCONN; return -1; }
 
     int n = mbedtls_ssl_read(&t->ssl, buf, len);
     if (n > 0) return n;
@@ -170,13 +202,14 @@ int ml_coord_tls_recv(microlink_t *ml, uint8_t *buf, size_t len) {
 }
 
 size_t ml_coord_tls_pending(microlink_t *ml) {
-    ml_coord_tls_t *t = &ml->coord_tls;
-    if (!t->active) return 0;
+    ml_coord_tls_t *t = tls_of(ml);
+    if (!t || !t->active) return 0;
     return mbedtls_ssl_get_bytes_avail(&t->ssl);
 }
 
 void ml_coord_tls_free(microlink_t *ml) {
-    ml_coord_tls_t *t = &ml->coord_tls;
+    ml_coord_tls_t *t = tls_of(ml);
+    if (!t) return;
     mbedtls_ssl_free(&t->ssl);
     mbedtls_ssl_config_free(&t->ssl_conf);
 #if ML_TLS_LEGACY_RNG
@@ -185,6 +218,11 @@ void ml_coord_tls_free(microlink_t *ml) {
 #endif
     t->sockfd = -1;
     t->active = false;
+#ifndef CONFIG_ML_CTRL_TLS
+    free(t);
+    s_tls = NULL;
+    s_tls_owner = NULL;
+#endif
 }
 
-#endif /* CONFIG_ML_CTRL_TLS */
+#endif /* CONFIG_ML_CTRL_TLS || ML_COORD_TLS_FALLBACK */
