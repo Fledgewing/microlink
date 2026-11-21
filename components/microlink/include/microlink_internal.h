@@ -494,13 +494,26 @@ typedef struct {
  * DERP Connection State
  * ========================================================================== */
 
+/* DERP relay TLS backend. 1: wolfSSL (the copy the application already
+ * compiles from source), whose session needs ~5 KB once connected instead of
+ * the prebuilt mbedTLS's ~37 KB (16 KB in and out record buffers). Defaults
+ * to the small-memory client mode; the transport is in ml_derp.c. */
+#ifndef ML_LITE_DERP_WOLFSSL
+#define ML_LITE_DERP_WOLFSSL CONFIG_ML_LITE
+#endif
+
 typedef struct {
     int sockfd;                     /* Raw TCP socket */
+#if ML_LITE_DERP_WOLFSSL
+    void *wctx;                     /* WOLFSSL_CTX* (owned exclusively by DERP I/O task) */
+    void *wssl;                     /* WOLFSSL* */
+#else
     mbedtls_ssl_context ssl;        /* TLS context (owned exclusively by DERP I/O task) */
     mbedtls_ssl_config ssl_conf;
 #if ML_TLS_LEGACY_RNG
     mbedtls_entropy_context entropy;
     mbedtls_ctr_drbg_context ctr_drbg;
+#endif
 #endif
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */

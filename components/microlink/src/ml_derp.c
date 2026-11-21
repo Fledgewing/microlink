@@ -25,11 +25,20 @@
 #include "esp_random.h"
 #include "lwip/sockets.h"
 #include "lwip/netdb.h"
-#include "mbedtls/net_sockets.h"
-#include "mbedtls/error.h"
 #include "esp_vfs_eventfd.h"
 #include <sys/select.h>
 #include <unistd.h>
+#include <time.h>
+#if ML_LITE_DERP_WOLFSSL
+/* Built with the application's wolfSSL (WOLFSSL_USER_SETTINGS); the build
+ * passes its include path and defines. */
+#include <wolfssl/wolfcrypt/settings.h>
+#include <wolfssl/ssl.h>
+#include <wolfssl/wolfcrypt/asn.h>
+#include <wolfssl/wolfcrypt/error-crypt.h>
+#else
+#include "mbedtls/net_sockets.h"
+#include "mbedtls/error.h"
 #if CONFIG_ML_DERP_VERIFY_CERT
 #include "esp_crt_bundle.h"
 #elif !defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
@@ -37,6 +46,7 @@
  * silently turns relay certificate checking off as well. Say so. */
 #warning "MBEDTLS_CERTIFICATE_BUNDLE is disabled: DERP relay TLS certificates will not be verified (ML_DERP_VERIFY_CERT unavailable)"
 #endif
+#endif /* ML_LITE_DERP_WOLFSSL */
 #include "nacl_box.h"
 #include <string.h>
 #include <errno.h>
@@ -46,6 +56,29 @@ static const char *TAG = "ml_derp";
 
 /* Timeout for DERP connection handshake operations */
 #define DERP_CONNECT_TIMEOUT_MS  10000
+
+/* ============================================================================
+ * DERP TLS transport
+ *
+ * Everything that touches the TLS library goes through these functions:
+ *   derp_tls_start()   - TLS setup + handshake on a connected socket
+ *   derp_tls_recv()    - read up to len bytes
+ *   derp_tls_send()    - write up to len bytes
+ *   derp_tls_pending() - decrypted bytes buffered inside the TLS session
+ *   derp_tls_close()   - close_notify + free the session (not the socket)
+ *   derp_tls_abort()   - free the session and close the socket (failure path)
+ * recv/send return the byte count, DERP_TLS_AGAIN when the socket timed out
+ * (retry), DERP_TLS_CLOSED on the peer's close_notify and another negative
+ * value on errors.
+ *
+ * Backends: mbedTLS (ESP-IDF's prebuilt one, default) and, when
+ * ML_LITE_DERP_WOLFSSL, wolfSSL.
+ * ========================================================================== */
+
+#define DERP_TLS_AGAIN   (-0x10000)
+#define DERP_TLS_CLOSED  (-0x10001)
+
+#if !ML_LITE_DERP_WOLFSSL
 
 /* ============================================================================
  * Custom BIO callbacks for TLS I/O
@@ -140,6 +173,469 @@ static void derp_tls_abort(ml_derp_conn_t *c, int sock) {
     c->sockfd = -1;
 }
 
+static int derp_tls_map(int ret) {
+    if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
+        ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+        return DERP_TLS_AGAIN;
+    }
+    if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) return DERP_TLS_CLOSED;
+    return ret;
+}
+
+static int derp_tls_recv(ml_derp_conn_t *c, uint8_t *buf, size_t len) {
+    return derp_tls_map(mbedtls_ssl_read(&c->ssl, buf, len));
+}
+
+static int derp_tls_send(ml_derp_conn_t *c, const uint8_t *buf, size_t len) {
+    return derp_tls_map(mbedtls_ssl_write(&c->ssl, buf, len));
+}
+
+static size_t derp_tls_pending(ml_derp_conn_t *c) {
+    return mbedtls_ssl_get_bytes_avail(&c->ssl);
+}
+
+static void derp_tls_close(ml_derp_conn_t *c) {
+    mbedtls_ssl_close_notify(&c->ssl);
+    mbedtls_ssl_free(&c->ssl);
+    mbedtls_ssl_config_free(&c->ssl_conf);
+#if ML_TLS_LEGACY_RNG
+    mbedtls_ctr_drbg_free(&c->ctr_drbg);
+    mbedtls_entropy_free(&c->entropy);
+#endif
+}
+
+/* TLS setup + handshake over the connected socket `sock`. On failure the
+ * session is freed and the socket closed. */
+static esp_err_t derp_tls_start(microlink_t *ml, ml_derp_conn_t *c, int sock,
+                                const char *derp_host) {
+    /* TLS setup */
+    mbedtls_ssl_init(&c->ssl);
+    mbedtls_ssl_config_init(&c->ssl_conf);
+#if ML_TLS_LEGACY_RNG
+    mbedtls_entropy_init(&c->entropy);
+    mbedtls_ctr_drbg_init(&c->ctr_drbg);
+#endif
+
+    /* Always check the return values of the mbedTLS setup functions and
+     * abort immediately on failure instead of proceeding to the handshake.
+     * On failure (typically ALLOC_FAILED), mbedtls_ssl_setup resets
+     * ssl->conf to NULL in its error label, so ignoring the error and
+     * proceeding to the handshake trips the sanity check with
+     * MBEDTLS_ERR_SSL_BAD_INPUT_DATA — misreported as "Bad input
+     * parameters" when the real cause is out-of-memory. */
+    int cfg_ret;
+#if ML_TLS_LEGACY_RNG
+    cfg_ret = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func,
+                           &c->entropy, NULL, 0);
+    if (cfg_ret != 0) {
+        ESP_LOGE(TAG, "ctr_drbg_seed failed: -0x%04x", -cfg_ret);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+#endif
+
+    cfg_ret = mbedtls_ssl_config_defaults(&c->ssl_conf,
+                                 MBEDTLS_SSL_IS_CLIENT,
+                                 MBEDTLS_SSL_TRANSPORT_STREAM,
+                                 MBEDTLS_SSL_PRESET_DEFAULT);
+    if (cfg_ret != 0) {
+        ESP_LOGE(TAG, "ssl_config_defaults failed: -0x%04x", -cfg_ret);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+#if CONFIG_ML_DERP_VERIFY_CERT
+    /* Verify the relay certificate against ESP-IDF's CA bundle; the host name
+     * is checked via mbedtls_ssl_set_hostname() below. */
+    mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
+    if (esp_crt_bundle_attach(&c->ssl_conf) != ESP_OK) {
+        ESP_LOGE(TAG, "TLS setup failed: could not attach the CA bundle");
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+#else
+    {
+        static bool s_warned;
+        if (!s_warned) {
+            s_warned = true;
+            ESP_LOGW(TAG, "DERP TLS certificates are not verified (%s)",
+#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
+                     "CONFIG_ML_DERP_VERIFY_CERT=n"
+#else
+                     "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n"
+#endif
+                     );
+        }
+    }
+    mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
+#endif
+#if ML_TLS_LEGACY_RNG
+    mbedtls_ssl_conf_rng(&c->ssl_conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
+#endif
+    /* Pin the DERP connection to TLS 1.2. When the DERP relay uses a
+     * Let's Encrypt ECDSA certificate, the ESP-IDF mbedTLS TLS 1.3 path
+     * cannot interpret the certificate's signature algorithm OID and fails
+     * with "X509 - Signature algorithm (oid) is unsupported" (even with
+     * authmode=VERIFY_NONE, TLS 1.3 cannot skip certificate processing).
+     * DERP also accepts TLS 1.2, so pin to 1.2 to bypass the 1.3
+     * certificate path. */
+    mbedtls_ssl_conf_max_tls_version(&c->ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
+
+    cfg_ret = mbedtls_ssl_setup(&c->ssl, &c->ssl_conf);
+    if (cfg_ret != 0) {
+        /* -0x7F00 (ALLOC_FAILED) means internal RAM exhaustion. To allocate
+         * the ~20KB TLS I/O buffers from PSRAM instead, set
+         * CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y. */
+        ESP_LOGE(TAG, "mbedtls_ssl_setup failed: -0x%04x", -cfg_ret);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+    cfg_ret = mbedtls_ssl_set_hostname(&c->ssl, derp_host);
+    if (cfg_ret != 0) {
+        ESP_LOGE(TAG, "ssl_set_hostname failed: -0x%04x", -cfg_ret);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+    /* Store socket fd BEFORE setting bio.
+     * Use custom BIO callbacks that route through ml_read_sock/ml_write_sock,
+     * which transparently support both lwIP and AT socket backends.
+     * Timeout is handled via SO_RCVTIMEO. */
+    c->sockfd = sock;
+    /* Pass a blocking recv as f_recv and set f_recv_timeout to NULL
+     * (same scheme as the control plane; avoids the TLS 1.3 Bad input
+     * data failure). */
+    mbedtls_ssl_set_bio(&c->ssl, &c->sockfd,
+                         ml_derp_bio_send, ml_derp_bio_recv, NULL);
+
+    /* TLS handshake - socket has 10s SO_RCVTIMEO from connect phase; the
+     * overall deadline stops a relay that accepts TCP and then stalls from
+     * hanging this task forever. */
+    int ret;
+    const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
+    while ((ret = mbedtls_ssl_handshake(&c->ssl)) != 0) {
+        if ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
+            esp_timer_get_time() < hs_deadline_us && !ml_shutdown_requested(ml)) {
+            continue;
+        }
+        char err_buf[128];
+#if defined(MBEDTLS_ERROR_C)
+        mbedtls_strerror(ret, err_buf, sizeof(err_buf));
+#else
+        /* CONFIG_MBEDTLS_ERROR_STRINGS=n: mbedTLS 4 has no strerror stub */
+        snprintf(err_buf, sizeof(err_buf), "-0x%04x", (unsigned)-ret);
+#endif
+        ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
+#if CONFIG_ML_DERP_VERIFY_CERT
+        uint32_t vflags = mbedtls_ssl_get_verify_result(&c->ssl);
+        if (vflags != 0 && vflags != (uint32_t)-1) {
+            char why[160];
+            mbedtls_x509_crt_verify_info(why, sizeof(why), "", vflags);
+            ESP_LOGE(TAG, "DERP certificate for %s not accepted: %s", derp_host, why);
+        }
+#endif
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+    return ESP_OK;
+}
+
+#else /* ML_LITE_DERP_WOLFSSL */
+
+/* ============================================================================
+ * wolfSSL backend
+ *
+ * The prebuilt mbedTLS has 16 KB in and out record buffers (~37 KB a
+ * session, not reconfigurable). wolfSSL sizes its buffers to the records it
+ * actually sends and receives: measured from the host against
+ * derp1/2/10.tailscale.com with the application's settings, ~5.4 KB stays
+ * allocated once connected and the TLS 1.3 handshake peaks at ~24 KB.
+ *
+ * Certificates: Tailscale's relays serve Let's Encrypt ECDSA chains
+ * (leaf P-256 <- YE1/YE2 P-384 <- Root YE, cross-signed by ISRG Root X2,
+ * itself cross-signed by ISRG Root X1), followed by a self-signed Ed25519
+ * "derpkey..." certificate that carries the relay's DERP key. The trust
+ * anchor is ISRG Root X2. derp_tls_verify_cb() then settles the two
+ * expected failures in that chain without trusting anything new:
+ *  - a chain certificate that is not a CA (the derpkey one) is ignored:
+ *    wolfSSL only adds verified CA certificates as signers, so the leaf
+ *    must still chain to the anchor;
+ *  - a CA certificate carrying a trust anchor's own public key (ISRG Root
+ *    X2 cross-signed by X1) is accepted: its signatures are the anchor's.
+ * Verifying through X1 instead costs an RSA-4096 operation (+11 KB peak).
+ * ========================================================================== */
+
+/* ISRG Root X2 (ECDSA P-384, valid to 2040-09-17), DER.
+ * SHA-256 69:72:9B:8E:15:A8:6E:FC:17:7A:57:AF:B7:17:1D:FC:
+ *         64:AD:D2:8C:2F:CA:8C:F1:50:7E:34:45:3C:CB:14:70 */
+static const unsigned char k_derp_root_isrg_x2[] = {
+    0x30, 0x82, 0x02, 0x1b, 0x30, 0x82, 0x01, 0xa1, 0xa0, 0x03, 0x02, 0x01, 0x02, 0x02, 0x10, 0x41,
+    0xd2, 0x9d, 0xd1, 0x72, 0xea, 0xee, 0xa7, 0x80, 0xc1, 0x2c, 0x6c, 0xe9, 0x2f, 0x87, 0x52, 0x30,
+    0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x03, 0x30, 0x4f, 0x31, 0x0b, 0x30,
+    0x09, 0x06, 0x03, 0x55, 0x04, 0x06, 0x13, 0x02, 0x55, 0x53, 0x31, 0x29, 0x30, 0x27, 0x06, 0x03,
+    0x55, 0x04, 0x0a, 0x13, 0x20, 0x49, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x65, 0x74, 0x20, 0x53, 0x65,
+    0x63, 0x75, 0x72, 0x69, 0x74, 0x79, 0x20, 0x52, 0x65, 0x73, 0x65, 0x61, 0x72, 0x63, 0x68, 0x20,
+    0x47, 0x72, 0x6f, 0x75, 0x70, 0x31, 0x15, 0x30, 0x13, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13, 0x0c,
+    0x49, 0x53, 0x52, 0x47, 0x20, 0x52, 0x6f, 0x6f, 0x74, 0x20, 0x58, 0x32, 0x30, 0x1e, 0x17, 0x0d,
+    0x32, 0x30, 0x30, 0x39, 0x30, 0x34, 0x30, 0x30, 0x30, 0x30, 0x30, 0x30, 0x5a, 0x17, 0x0d, 0x34,
+    0x30, 0x30, 0x39, 0x31, 0x37, 0x31, 0x36, 0x30, 0x30, 0x30, 0x30, 0x5a, 0x30, 0x4f, 0x31, 0x0b,
+    0x30, 0x09, 0x06, 0x03, 0x55, 0x04, 0x06, 0x13, 0x02, 0x55, 0x53, 0x31, 0x29, 0x30, 0x27, 0x06,
+    0x03, 0x55, 0x04, 0x0a, 0x13, 0x20, 0x49, 0x6e, 0x74, 0x65, 0x72, 0x6e, 0x65, 0x74, 0x20, 0x53,
+    0x65, 0x63, 0x75, 0x72, 0x69, 0x74, 0x79, 0x20, 0x52, 0x65, 0x73, 0x65, 0x61, 0x72, 0x63, 0x68,
+    0x20, 0x47, 0x72, 0x6f, 0x75, 0x70, 0x31, 0x15, 0x30, 0x13, 0x06, 0x03, 0x55, 0x04, 0x03, 0x13,
+    0x0c, 0x49, 0x53, 0x52, 0x47, 0x20, 0x52, 0x6f, 0x6f, 0x74, 0x20, 0x58, 0x32, 0x30, 0x76, 0x30,
+    0x10, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01, 0x06, 0x05, 0x2b, 0x81, 0x04, 0x00,
+    0x22, 0x03, 0x62, 0x00, 0x04, 0xcd, 0x9b, 0xd5, 0x9f, 0x80, 0x83, 0x0a, 0xec, 0x09, 0x4a, 0xf3,
+    0x16, 0x4a, 0x3e, 0x5c, 0xcf, 0x77, 0xac, 0xde, 0x67, 0x05, 0x0d, 0x1d, 0x07, 0xb6, 0xdc, 0x16,
+    0xfb, 0x5a, 0x8b, 0x14, 0xdb, 0xe2, 0x71, 0x60, 0xc4, 0xba, 0x45, 0x95, 0x11, 0x89, 0x8e, 0xea,
+    0x06, 0xdf, 0xf7, 0x2a, 0x16, 0x1c, 0xa4, 0xb9, 0xc5, 0xc5, 0x32, 0xe0, 0x03, 0xe0, 0x1e, 0x82,
+    0x18, 0x38, 0x8b, 0xd7, 0x45, 0xd8, 0x0a, 0x6a, 0x6e, 0xe6, 0x00, 0x77, 0xfb, 0x02, 0x51, 0x7d,
+    0x22, 0xd8, 0x0a, 0x6e, 0x9a, 0x5b, 0x77, 0xdf, 0xf0, 0xfa, 0x41, 0xec, 0x39, 0xdc, 0x75, 0xca,
+    0x68, 0x07, 0x0c, 0x1f, 0xea, 0xa3, 0x42, 0x30, 0x40, 0x30, 0x0e, 0x06, 0x03, 0x55, 0x1d, 0x0f,
+    0x01, 0x01, 0xff, 0x04, 0x04, 0x03, 0x02, 0x01, 0x06, 0x30, 0x0f, 0x06, 0x03, 0x55, 0x1d, 0x13,
+    0x01, 0x01, 0xff, 0x04, 0x05, 0x30, 0x03, 0x01, 0x01, 0xff, 0x30, 0x1d, 0x06, 0x03, 0x55, 0x1d,
+    0x0e, 0x04, 0x16, 0x04, 0x14, 0x7c, 0x42, 0x96, 0xae, 0xde, 0x4b, 0x48, 0x3b, 0xfa, 0x92, 0xf8,
+    0x9e, 0x8c, 0xcf, 0x6d, 0x8b, 0xa9, 0x72, 0x37, 0x95, 0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48,
+    0xce, 0x3d, 0x04, 0x03, 0x03, 0x03, 0x68, 0x00, 0x30, 0x65, 0x02, 0x30, 0x7b, 0x79, 0x4e, 0x46,
+    0x50, 0x84, 0xc2, 0x44, 0x87, 0x46, 0x1b, 0x45, 0x70, 0xff, 0x58, 0x99, 0xde, 0xf4, 0xfd, 0xa4,
+    0xd2, 0x55, 0xa6, 0x20, 0x2d, 0x74, 0xd6, 0x34, 0xbc, 0x41, 0xa3, 0x50, 0x5f, 0x01, 0x27, 0x56,
+    0xb4, 0xbe, 0x27, 0x75, 0x06, 0xaf, 0x12, 0x2e, 0x75, 0x98, 0x8d, 0xfc, 0x02, 0x31, 0x00, 0x8b,
+    0xf5, 0x77, 0x6c, 0xd4, 0xc8, 0x65, 0xaa, 0xe0, 0x0b, 0x2c, 0xee, 0x14, 0x9d, 0x27, 0x37, 0xa4,
+    0xf9, 0x53, 0xa5, 0x51, 0xe4, 0x29, 0x83, 0xd7, 0xf8, 0x90, 0x31, 0x5b, 0x42, 0x9f, 0x0a, 0xf5,
+    0xfe, 0xae, 0x00, 0x68, 0xe7, 0x8c, 0x49, 0x0f, 0xb6, 0x6f, 0x5b, 0x5b, 0x15, 0xf2, 0xe7,
+};
+
+/* Before this the clock has not been set (no SNTP/RTC time yet). */
+#define DERP_TLS_CLOCK_VALID_AFTER  1735689600  /* 2025-01-01 */
+
+static int derp_wolf_recv(WOLFSSL *ssl, char *buf, int sz, void *ctx) {
+    (void)ssl;
+    int fd = *(int *)ctx;
+    if (fd < 0) return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+    int ret = (int)ml_read_sock(fd, buf, sz);
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return WOLFSSL_CBIO_ERR_WANT_READ;
+        }
+        if (errno == EPIPE || errno == ECONNRESET) return WOLFSSL_CBIO_ERR_CONN_RST;
+        return WOLFSSL_CBIO_ERR_GENERAL;
+    }
+    if (ret == 0) return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+    return ret;
+}
+
+static int derp_wolf_send(WOLFSSL *ssl, char *buf, int sz, void *ctx) {
+    (void)ssl;
+    int fd = *(int *)ctx;
+    if (fd < 0) return WOLFSSL_CBIO_ERR_CONN_CLOSE;
+    int ret = (int)ml_write_sock(fd, buf, sz);
+    if (ret < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR) {
+            return WOLFSSL_CBIO_ERR_WANT_WRITE;
+        }
+        if (errno == EPIPE || errno == ECONNRESET) return WOLFSSL_CBIO_ERR_CONN_RST;
+        return WOLFSSL_CBIO_ERR_GENERAL;
+    }
+    return ret;
+}
+
+#if CONFIG_ML_DERP_VERIFY_CERT
+/* See the backend comment above. Called only for certificates wolfSSL
+ * rejected (preverify == 0); returning 1 overrides that one error. */
+static int derp_tls_verify_cb(int preverify, WOLFSSL_X509_STORE_CTX *store) {
+    if (preverify) return 1;
+    const int err = store->error;
+    const int depth = store->error_depth;
+
+    /* The prebuilt mbedTLS never checks validity dates
+     * (MBEDTLS_HAVE_TIME_DATE is off). Match it while the clock is unset;
+     * once it is set, dates are enforced. wolfSSL reports a date error only
+     * after the signature checked out. */
+    if ((err == ASN_BEFORE_DATE_E || err == ASN_AFTER_DATE_E) &&
+        time(NULL) < DERP_TLS_CLOCK_VALID_AFTER) {
+        ESP_LOGW(TAG, "DERP cert %d (%s): dates not checked, clock unset", depth,
+                 store->domain ? store->domain : "");
+        return 1;
+    }
+    if (depth <= 0 || depth >= store->totalCerts || store->certs == NULL) goto reject;
+
+    DecodedCert *dc = malloc(2 * sizeof(DecodedCert));
+    if (!dc) goto reject;
+    int accept = 0;
+    const char *why = "";
+    wc_InitDecodedCert(&dc[0], store->certs[depth].buffer, store->certs[depth].length, NULL);
+    /* NO_VERIFY: only reads the fields. A certificate whose key wolfSSL
+     * can't parse (Ed25519 here) stops before its extensions, as it did in
+     * the handshake, so isCA stays 0 there too and it is never a signer. */
+    (void)wc_ParseCert(&dc[0], CERT_TYPE, NO_VERIFY, NULL);
+    if (!dc[0].isCA) {
+        accept = 1;
+        why = "not a CA, ignored";
+    } else if (dc[0].publicKey != NULL) {
+        wc_InitDecodedCert(&dc[1], k_derp_root_isrg_x2, sizeof(k_derp_root_isrg_x2), NULL);
+        if (wc_ParseCert(&dc[1], CA_TYPE, NO_VERIFY, NULL) == 0 &&
+            dc[1].publicKey != NULL && dc[0].pubKeySize == dc[1].pubKeySize &&
+            memcmp(dc[0].publicKey, dc[1].publicKey, dc[1].pubKeySize) == 0) {
+            accept = 1;
+            why = "trust anchor key";
+        }
+        wc_FreeDecodedCert(&dc[1]);
+    }
+    wc_FreeDecodedCert(&dc[0]);
+    free(dc);
+    if (accept) {
+        ESP_LOGD(TAG, "DERP chain cert %d (%s): error %d, %s", depth,
+                 store->domain ? store->domain : "", err, why);
+        return 1;
+    }
+reject:
+    ESP_LOGE(TAG, "DERP certificate %d (%s) not accepted: error %d", depth,
+             store->domain ? store->domain : "", err);
+    return 0;
+}
+#endif /* CONFIG_ML_DERP_VERIFY_CERT */
+
+static void derp_tls_free(ml_derp_conn_t *c) {
+    if (c->wssl) {
+        wolfSSL_free((WOLFSSL *)c->wssl);
+        c->wssl = NULL;
+    }
+    if (c->wctx) {
+        wolfSSL_CTX_free((WOLFSSL_CTX *)c->wctx);
+        c->wctx = NULL;
+    }
+}
+
+static void derp_tls_abort(ml_derp_conn_t *c, int sock) {
+    derp_tls_free(c);
+    if (sock >= 0) {
+        ml_close_sock(sock);
+    }
+    c->sockfd = -1;
+}
+
+static int derp_tls_map(ml_derp_conn_t *c, int ret) {
+    if (ret > 0) return ret;
+    const int err = wolfSSL_get_error((WOLFSSL *)c->wssl, ret);
+    if (err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) return DERP_TLS_AGAIN;
+    if (err == WOLFSSL_ERROR_ZERO_RETURN) return DERP_TLS_CLOSED;
+    /* A dropped socket (SOCKET_PEER_CLOSED_E) is an error, as with mbedTLS
+     * (its BIO maps a 0-byte read to CONN_RESET). */
+    return err < 0 ? err : -1;
+}
+
+static int derp_tls_recv(ml_derp_conn_t *c, uint8_t *buf, size_t len) {
+    if (!c->wssl) return -1;
+    return derp_tls_map(c, wolfSSL_read((WOLFSSL *)c->wssl, buf, (int)len));
+}
+
+static int derp_tls_send(ml_derp_conn_t *c, const uint8_t *buf, size_t len) {
+    if (!c->wssl) return -1;
+    if (len == 0) return 0;
+    return derp_tls_map(c, wolfSSL_write((WOLFSSL *)c->wssl, buf, (int)len));
+}
+
+static size_t derp_tls_pending(ml_derp_conn_t *c) {
+    if (!c->wssl) return 0;
+    int n = wolfSSL_pending((WOLFSSL *)c->wssl);
+    return n > 0 ? (size_t)n : 0;
+}
+
+static void derp_tls_close(ml_derp_conn_t *c) {
+    if (c->wssl) wolfSSL_shutdown((WOLFSSL *)c->wssl);
+    derp_tls_free(c);
+}
+
+static void derp_tls_log_error(const char *what, int err) {
+    char why[80];
+    wolfSSL_ERR_error_string_n((unsigned long)err, why, sizeof(why));
+    ESP_LOGE(TAG, "%s: %d (%s), free heap %u, largest block %u", what, err, why,
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+}
+
+/* TLS setup + handshake over the connected socket `sock`. On failure the
+ * session is freed and the socket closed. */
+static esp_err_t derp_tls_start(microlink_t *ml, ml_derp_conn_t *c, int sock,
+                                const char *derp_host) {
+    c->wctx = NULL;
+    c->wssl = NULL;
+    /* TLS 1.2 or 1.3; Tailscale's relays (Go crypto/tls) pick 1.3. */
+    WOLFSSL_CTX *ctx = wolfSSL_CTX_new(wolfSSLv23_client_method());
+    if (!ctx) {
+        derp_tls_log_error("DERP TLS context alloc failed", MEMORY_E);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+    c->wctx = ctx;
+    /* No resumption: the client session cache is global and unlocked
+     * (SINGLE_THREADED), and the application's own TLS uses it. */
+    wolfSSL_CTX_set_session_cache_mode(ctx, WOLFSSL_SESS_CACHE_OFF);
+#if CONFIG_ML_DERP_VERIFY_CERT
+    int lret = wolfSSL_CTX_load_verify_buffer(ctx, k_derp_root_isrg_x2,
+                                              sizeof(k_derp_root_isrg_x2),
+                                              WOLFSSL_FILETYPE_ASN1);
+    if (lret != WOLFSSL_SUCCESS) {
+        derp_tls_log_error("DERP TLS: loading the root certificate failed", lret);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_PEER, derp_tls_verify_cb);
+#else
+    {
+        static bool s_warned;
+        if (!s_warned) {
+            s_warned = true;
+            ESP_LOGW(TAG, "DERP TLS certificates are not verified (CONFIG_ML_DERP_VERIFY_CERT=n)");
+        }
+    }
+    wolfSSL_CTX_set_verify(ctx, WOLFSSL_VERIFY_NONE, NULL);
+#endif
+    wolfSSL_SetIORecv(ctx, derp_wolf_recv);
+    wolfSSL_SetIOSend(ctx, derp_wolf_send);
+
+    WOLFSSL *ssl = wolfSSL_new(ctx);
+    if (!ssl) {
+        derp_tls_log_error("DERP TLS session alloc failed", MEMORY_E);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+    c->wssl = ssl;
+    c->sockfd = sock;
+    wolfSSL_SetIOReadCtx(ssl, &c->sockfd);
+    wolfSSL_SetIOWriteCtx(ssl, &c->sockfd);
+    wolfSSL_UseSNI(ssl, WOLFSSL_SNI_HOST_NAME, derp_host, (unsigned short)strlen(derp_host));
+#if CONFIG_ML_DERP_VERIFY_CERT
+    if (wolfSSL_check_domain_name(ssl, derp_host) != WOLFSSL_SUCCESS) {
+        derp_tls_log_error("DERP TLS: setting the host name failed", MEMORY_E);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+#endif
+#if defined(WOLFSSL_TLS13) && defined(HAVE_CURVE25519)
+    /* One X25519 key share: no bignum temporaries, and Go offers it first. */
+    wolfSSL_UseKeyShare(ssl, WOLFSSL_ECC_X25519);
+#endif
+
+    /* Socket has 10s SO_RCVTIMEO from the connect phase; the overall
+     * deadline stops a relay that accepts TCP and then stalls. */
+    const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
+    int ret;
+    while ((ret = wolfSSL_connect(ssl)) != WOLFSSL_SUCCESS) {
+        int err = wolfSSL_get_error(ssl, ret);
+        if ((err == WOLFSSL_ERROR_WANT_READ || err == WOLFSSL_ERROR_WANT_WRITE) &&
+            esp_timer_get_time() < hs_deadline_us && !ml_shutdown_requested(ml)) {
+            continue;
+        }
+        derp_tls_log_error("TLS handshake failed", err);
+        derp_tls_abort(c, sock);
+        return ESP_FAIL;
+    }
+    ESP_LOGI(TAG, "DERP TLS (wolfSSL) %s %s, free heap %u", wolfSSL_get_version(ssl),
+             wolfSSL_get_cipher(ssl), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    return ESP_OK;
+}
+
+#endif /* ML_LITE_DERP_WOLFSSL */
+
 /* DERP frame types */
 #define DERP_FRAME_SERVER_KEY   0x01
 #define DERP_FRAME_CLIENT_INFO  0x02
@@ -178,14 +674,13 @@ static int derp_tls_read_all(ml_derp_conn_t *c, uint8_t *data, size_t len, int t
             return -2;
         }
 
-        int ret = mbedtls_ssl_read(&c->ssl, data + received, len - received);
+        int ret = derp_tls_recv(c, data + received, len - received);
         if (ret < 0) {
-            if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
-                ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+            if (ret == DERP_TLS_AGAIN) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 continue;
             }
-            if (ret == MBEDTLS_ERR_SSL_PEER_CLOSE_NOTIFY) {
+            if (ret == DERP_TLS_CLOSED) {
                 ESP_LOGW(TAG, "DERP server closed connection");
                 return -1;
             }
@@ -233,10 +728,9 @@ static int derp_tls_write_all(ml_derp_conn_t *c, const uint8_t *data, size_t len
     const int max_retries = 50;  /* 50 * 10ms = 500ms max */
 
     while (written < len) {
-        int ret = mbedtls_ssl_write(&c->ssl, data + written, len - written);
+        int ret = derp_tls_send(c, data + written, len - written);
         if (ret < 0) {
-            if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
-                ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+            if (ret == DERP_TLS_AGAIN) {
                 vTaskDelay(pdMS_TO_TICKS(10));
                 if (++retries > max_retries) {
                     ESP_LOGW(TAG, "TLS write timeout after %d retries", retries);
@@ -396,9 +890,8 @@ static int poll_derp_read(microlink_t *ml, ml_derp_conn_t *c) {
     /* Read 5-byte frame header.
      * SO_RCVTIMEO=100ms ensures read() returns within 100ms if no data. */
     uint8_t header[5];
-    int n = mbedtls_ssl_read(&c->ssl, header, 5);
-    if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
-        n == MBEDTLS_ERR_SSL_TIMEOUT) {
+    int n = derp_tls_recv(c, header, 5);
+    if (n == DERP_TLS_AGAIN) {
         return 0;  /* No data available / timeout */
     }
     if (n <= 0) {
@@ -448,9 +941,8 @@ static int poll_derp_read(microlink_t *ml, ml_derp_conn_t *c) {
             free(buf);
             return -1;
         }
-        n = mbedtls_ssl_read(&c->ssl, buf + total_read, len - total_read);
-        if (n == MBEDTLS_ERR_SSL_WANT_READ || n == MBEDTLS_ERR_SSL_WANT_WRITE ||
-            n == MBEDTLS_ERR_SSL_TIMEOUT) {
+        n = derp_tls_recv(c, buf + total_read, len - total_read);
+        if (n == DERP_TLS_AGAIN) {
             vTaskDelay(pdMS_TO_TICKS(5));
             continue;
         }
@@ -532,10 +1024,10 @@ static void derp_wake_init(microlink_t *ml) {
 
 void ml_derp_idle_wait(microlink_t *ml, uint32_t max_ms) {
     if (uxQueueMessagesWaiting(ml->derp_tx_queue) > 0) return;
-    if (ml->derp.connected && mbedtls_ssl_get_bytes_avail(&ml->derp.ssl) > 0) return;
+    if (ml->derp.connected && derp_tls_pending(&ml->derp) > 0) return;
     for (int i = 0; i < ML_DERP_EXTRA_CONNS; i++) {
         ml_derp_conn_t *x = &ml->derp_extra[i];
-        if (x->connected && mbedtls_ssl_get_bytes_avail(&x->ssl) > 0) return;
+        if (x->connected && derp_tls_pending(x) > 0) return;
     }
 
     int sock = ml->derp.sockfd;
@@ -1024,131 +1516,7 @@ static esp_err_t derp_conn_open(microlink_t *ml, ml_derp_conn_t *c, const char *
     int64_t t_derp_tcp = esp_timer_get_time();
     ESP_LOGD(TAG, "[TIMING] DERP TCP connect: %ld ms", (long)((t_derp_tcp - t_derp_dns) / 1000));
 
-    /* TLS setup */
-    mbedtls_ssl_init(&c->ssl);
-    mbedtls_ssl_config_init(&c->ssl_conf);
-#if ML_TLS_LEGACY_RNG
-    mbedtls_entropy_init(&c->entropy);
-    mbedtls_ctr_drbg_init(&c->ctr_drbg);
-#endif
-
-    /* Always check the return values of the mbedTLS setup functions and
-     * abort immediately on failure instead of proceeding to the handshake.
-     * On failure (typically ALLOC_FAILED), mbedtls_ssl_setup resets
-     * ssl->conf to NULL in its error label, so ignoring the error and
-     * proceeding to the handshake trips the sanity check with
-     * MBEDTLS_ERR_SSL_BAD_INPUT_DATA — misreported as "Bad input
-     * parameters" when the real cause is out-of-memory. */
-    int cfg_ret;
-#if ML_TLS_LEGACY_RNG
-    cfg_ret = mbedtls_ctr_drbg_seed(&c->ctr_drbg, mbedtls_entropy_func,
-                           &c->entropy, NULL, 0);
-    if (cfg_ret != 0) {
-        ESP_LOGE(TAG, "ctr_drbg_seed failed: -0x%04x", -cfg_ret);
-        derp_tls_abort(c, sock);
-        return ESP_FAIL;
-    }
-#endif
-
-    cfg_ret = mbedtls_ssl_config_defaults(&c->ssl_conf,
-                                 MBEDTLS_SSL_IS_CLIENT,
-                                 MBEDTLS_SSL_TRANSPORT_STREAM,
-                                 MBEDTLS_SSL_PRESET_DEFAULT);
-    if (cfg_ret != 0) {
-        ESP_LOGE(TAG, "ssl_config_defaults failed: -0x%04x", -cfg_ret);
-        derp_tls_abort(c, sock);
-        return ESP_FAIL;
-    }
-#if CONFIG_ML_DERP_VERIFY_CERT
-    /* Verify the relay certificate against ESP-IDF's CA bundle; the host name
-     * is checked via mbedtls_ssl_set_hostname() below. */
-    mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_REQUIRED);
-    if (esp_crt_bundle_attach(&c->ssl_conf) != ESP_OK) {
-        ESP_LOGE(TAG, "TLS setup failed: could not attach the CA bundle");
-        derp_tls_abort(c, sock);
-        return ESP_FAIL;
-    }
-#else
-    {
-        static bool s_warned;
-        if (!s_warned) {
-            s_warned = true;
-            ESP_LOGW(TAG, "DERP TLS certificates are not verified (%s)",
-#if defined(CONFIG_MBEDTLS_CERTIFICATE_BUNDLE)
-                     "CONFIG_ML_DERP_VERIFY_CERT=n"
-#else
-                     "CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n"
-#endif
-                     );
-        }
-    }
-    mbedtls_ssl_conf_authmode(&c->ssl_conf, MBEDTLS_SSL_VERIFY_NONE);
-#endif
-#if ML_TLS_LEGACY_RNG
-    mbedtls_ssl_conf_rng(&c->ssl_conf, mbedtls_ctr_drbg_random, &c->ctr_drbg);
-#endif
-    /* Pin the DERP connection to TLS 1.2. When the DERP relay uses a
-     * Let's Encrypt ECDSA certificate, the ESP-IDF mbedTLS TLS 1.3 path
-     * cannot interpret the certificate's signature algorithm OID and fails
-     * with "X509 - Signature algorithm (oid) is unsupported" (even with
-     * authmode=VERIFY_NONE, TLS 1.3 cannot skip certificate processing).
-     * DERP also accepts TLS 1.2, so pin to 1.2 to bypass the 1.3
-     * certificate path. */
-    mbedtls_ssl_conf_max_tls_version(&c->ssl_conf, MBEDTLS_SSL_VERSION_TLS1_2);
-
-    cfg_ret = mbedtls_ssl_setup(&c->ssl, &c->ssl_conf);
-    if (cfg_ret != 0) {
-        /* -0x7F00 (ALLOC_FAILED) means internal RAM exhaustion. To allocate
-         * the ~20KB TLS I/O buffers from PSRAM instead, set
-         * CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y. */
-        ESP_LOGE(TAG, "mbedtls_ssl_setup failed: -0x%04x", -cfg_ret);
-        derp_tls_abort(c, sock);
-        return ESP_FAIL;
-    }
-    cfg_ret = mbedtls_ssl_set_hostname(&c->ssl, derp_host);
-    if (cfg_ret != 0) {
-        ESP_LOGE(TAG, "ssl_set_hostname failed: -0x%04x", -cfg_ret);
-        derp_tls_abort(c, sock);
-        return ESP_FAIL;
-    }
-    /* Store socket fd BEFORE setting bio.
-     * Use custom BIO callbacks that route through ml_read_sock/ml_write_sock,
-     * which transparently support both lwIP and AT socket backends.
-     * Timeout is handled via SO_RCVTIMEO. */
-    c->sockfd = sock;
-    /* Pass a blocking recv as f_recv and set f_recv_timeout to NULL
-     * (same scheme as the control plane; avoids the TLS 1.3 Bad input
-     * data failure). */
-    mbedtls_ssl_set_bio(&c->ssl, &c->sockfd,
-                         ml_derp_bio_send, ml_derp_bio_recv, NULL);
-
-    /* TLS handshake - socket has 10s SO_RCVTIMEO from connect phase; the
-     * overall deadline stops a relay that accepts TCP and then stalls from
-     * hanging this task forever. */
-    int ret;
-    const int64_t hs_deadline_us = esp_timer_get_time() + 20LL * 1000 * 1000;
-    while ((ret = mbedtls_ssl_handshake(&c->ssl)) != 0) {
-        if ((ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE) &&
-            esp_timer_get_time() < hs_deadline_us && !ml_shutdown_requested(ml)) {
-            continue;
-        }
-        char err_buf[128];
-#if defined(MBEDTLS_ERROR_C)
-        mbedtls_strerror(ret, err_buf, sizeof(err_buf));
-#else
-        /* CONFIG_MBEDTLS_ERROR_STRINGS=n: mbedTLS 4 has no strerror stub */
-        snprintf(err_buf, sizeof(err_buf), "-0x%04x", (unsigned)-ret);
-#endif
-        ESP_LOGE(TAG, "TLS handshake failed: %s", err_buf);
-#if CONFIG_ML_DERP_VERIFY_CERT
-        uint32_t vflags = mbedtls_ssl_get_verify_result(&c->ssl);
-        if (vflags != 0 && vflags != (uint32_t)-1) {
-            char why[160];
-            mbedtls_x509_crt_verify_info(why, sizeof(why), "", vflags);
-            ESP_LOGE(TAG, "DERP certificate for %s not accepted: %s", derp_host, why);
-        }
-#endif
-        derp_tls_abort(c, sock);
+    if (derp_tls_start(ml, c, sock, derp_host) != ESP_OK) {
         return ESP_FAIL;
     }
 
@@ -1166,7 +1534,7 @@ static esp_err_t derp_conn_open(microlink_t *ml, ml_derp_conn_t *c, const char *
              "\r\n",
              derp_host);
 
-    ret = mbedtls_ssl_write(&c->ssl, (const uint8_t *)upgrade_req, strlen(upgrade_req));
+    int ret = derp_tls_send(c, (const uint8_t *)upgrade_req, strlen(upgrade_req));
     if (ret < 0) {
         ESP_LOGE(TAG, "Failed to send HTTP upgrade");
         derp_tls_abort(c, sock);
@@ -1188,10 +1556,9 @@ static esp_err_t derp_conn_open(microlink_t *ml, ml_derp_conn_t *c, const char *
                 return ESP_FAIL;
             }
 
-            ret = mbedtls_ssl_read(&c->ssl, resp_buf + resp_len, 1);
+            ret = derp_tls_recv(c, resp_buf + resp_len, 1);
             if (ret < 0) {
-                if (ret == MBEDTLS_ERR_SSL_WANT_READ || ret == MBEDTLS_ERR_SSL_WANT_WRITE ||
-                    ret == MBEDTLS_ERR_SSL_TIMEOUT) {
+                if (ret == DERP_TLS_AGAIN) {
                     vTaskDelay(pdMS_TO_TICKS(10));
                     continue;
                 }
@@ -1417,13 +1784,7 @@ static esp_err_t derp_conn_open(microlink_t *ml, ml_derp_conn_t *c, const char *
 static void derp_conn_close(ml_derp_conn_t *c) {
     c->connected = false;
     if (c->sockfd >= 0) {
-        mbedtls_ssl_close_notify(&c->ssl);
-        mbedtls_ssl_free(&c->ssl);
-        mbedtls_ssl_config_free(&c->ssl_conf);
-#if ML_TLS_LEGACY_RNG
-        mbedtls_ctr_drbg_free(&c->ctr_drbg);
-        mbedtls_entropy_free(&c->entropy);
-#endif
+        derp_tls_close(c);
         ml_close_sock(c->sockfd);
         c->sockfd = -1;
     }
