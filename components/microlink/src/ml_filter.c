@@ -3,6 +3,7 @@
  * See ml_filter.h for semantics. IPv4 only (MicroLink's tunnel is IPv4).
  */
 #include "ml_filter.h"
+#include "ml_lite.h"
 #include "cJSON.h"
 #include <stdlib.h>
 #include <string.h>
@@ -31,14 +32,25 @@ static SemaphoreHandle_t s_lock;
 #define F_LOGD(...) do { } while (0)
 #endif
 
+#if ML_LITE_SMALL_FILTER
+/* A client that only takes replies to its own connections: few rules, few
+ * UDP flows. A set over MAX_ENTRIES (or a set past MAX_SETS) allows no new
+ * inbound traffic, which is what such a client wants anyway. Policies are
+ * heap-allocated only when the filter is on; the flow and set tables are
+ * static RAM (~1.8 KB -> ~0.3 KB). */
+#define MAX_ENTRIES     256
+#define MAX_SETS        2
+#define FLOW_SLOTS      8
+#else
 #ifdef CONFIG_ML_FILTER_MAX_ENTRIES
 #define MAX_ENTRIES CONFIG_ML_FILTER_MAX_ENTRIES
 #else
 #define MAX_ENTRIES 4096        /* src + dst entries per named set */
 #endif
 #define MAX_SETS        8
-#define MAX_PROTOS      8
 #define FLOW_SLOTS      64
+#endif
+#define MAX_PROTOS      8
 #define FLOW_TIMEOUT_MS 120000u
 
 #define PROTO_ICMP  1
