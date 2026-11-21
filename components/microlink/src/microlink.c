@@ -201,6 +201,15 @@ static portMUX_TYPE s_orphan_mux = portMUX_INITIALIZER_UNLOCKED;
  * NVS cache is process-wide and is closed when the last one goes. */
 static int s_live_contexts;
 
+/* Free the context memory itself (and, with ML_LITE_CONTEXT, the DERP
+ * region table allocated beside it). */
+static void ml_ctx_free(microlink_t *ml) {
+#if ML_LITE_CONTEXT
+    free(ml->derp_regions);
+#endif
+    free(ml);
+}
+
 uint32_t ml_tasks_alive(const microlink_t *ml) {
     if (!ml) return 0;
     return __atomic_load_n(&ml->tasks_alive, __ATOMIC_ACQUIRE);
@@ -346,7 +355,7 @@ static void ml_release(microlink_t *ml) {
     memset(ml->wg_private_key, 0, 32);
     memset(ml->disco_private_key, 0, 32);
 
-    free(ml);
+    ml_ctx_free(ml);
 
     bool last;
     portENTER_CRITICAL(&s_orphan_mux);
@@ -434,9 +443,21 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     /* Allocate context from PSRAM */
     microlink_t *ml = ml_psram_calloc(1, sizeof(microlink_t));
     if (!ml) {
-        ESP_LOGE(TAG, "Failed to allocate context");
+        ESP_LOGE(TAG, "Failed to allocate context (%u bytes)", (unsigned)sizeof(microlink_t));
         return NULL;
     }
+#if ML_LITE_CONTEXT
+    ml->derp_regions = ml_psram_calloc(ML_MAX_DERP_REGIONS, sizeof(ml_derp_region_t));
+    if (!ml->derp_regions) {
+        ESP_LOGE(TAG, "Failed to allocate DERP region table (%u bytes)",
+                 (unsigned)(ML_MAX_DERP_REGIONS * sizeof(ml_derp_region_t)));
+        free(ml);
+        return NULL;
+    }
+    ESP_LOGI(TAG, "Lite context: %u bytes + DERP regions %u bytes",
+             (unsigned)sizeof(microlink_t),
+             (unsigned)(ML_MAX_DERP_REGIONS * sizeof(ml_derp_region_t)));
+#endif
 
     /* Copy config */
     ml->config = *config;
@@ -456,7 +477,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
                                sizeof(ml->ctrl_host) - 1)) {
             ESP_LOGE(TAG, "Invalid ctrl_host: must be a host name of letters, "
                      "digits, '-' and '.' (max %u)", (unsigned)(sizeof(ml->ctrl_host) - 1));
-            free(ml);
+            ml_ctx_free(ml);
             return NULL;
         }
         strncpy(ml->ctrl_host, config->ctrl_host, sizeof(ml->ctrl_host) - 1);
@@ -477,13 +498,13 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (nroutes < 0 || nroutes6 < 0) {
         ESP_LOGE(TAG, "Invalid advertise_routes \"%s\": expected up to %d IPv4 and %d IPv6 "
                  "prefixes such as 192.168.1.0/24 or fd12:3456::/64", routes, ML_MAX_ROUTES, ML_MAX_ROUTES);
-        free(ml);
+        ml_ctx_free(ml);
         return NULL;
     }
 #ifndef CONFIG_ML_ROUTER_IPV6
     if (nroutes6 > 0) {
         ESP_LOGE(TAG, "IPv6 routes in advertise_routes need CONFIG_ML_ROUTER_IPV6");
-        free(ml);
+        ml_ctx_free(ml);
         return NULL;
     }
 #endif
@@ -491,7 +512,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     if (nroutes > 0 || nroutes6 > 0) {
         ESP_LOGE(TAG, "advertise_routes is set but CONFIG_ML_SUBNET_ROUTER is off "
                  "(the device could not forward the traffic)");
-        free(ml);
+        ml_ctx_free(ml);
         return NULL;
     }
 #endif
@@ -535,7 +556,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
 
     /* Load or generate persistent keys */
     if (load_or_generate_keys(ml) != ESP_OK) {
-        free(ml);
+        ml_ctx_free(ml);
         return NULL;
     }
 
@@ -686,6 +707,11 @@ esp_err_t microlink_start(microlink_t *ml) {
 
 bsd_socket_fallback:
 #endif
+#if ML_LITE_NO_DIRECT
+    /* DERP only: no DISCO/WireGuard UDP socket (and so no STUN and no direct
+     * path). WireGuard traffic and DISCO from peers arrive over DERP. */
+    ESP_LOGI(TAG, "DERP-only mode: no direct UDP path");
+#else
     /* Create DISCO/magicsock UDP socket (port 51820 = WireGuard standard)
      * This is the single socket for ALL direct UDP traffic: DISCO pings/pongs,
      * CallMeMaybe probes, and WireGuard encrypted data.
@@ -722,6 +748,7 @@ bsd_socket_fallback:
     } else {
         ESP_LOGE(TAG, "Failed to create DISCO socket: errno=%d", errno);
     }
+#endif /* ML_LITE_NO_DIRECT */
 #ifdef CONFIG_ML_ZERO_COPY_WG
 skip_bsd_socket:
     ;
@@ -740,12 +767,35 @@ skip_bsd_socket:
         BaseType_t core;
         uint32_t bit;
     } tasks[] = {
+#if !ML_LITE_NO_DIRECT
+        /* net_io only serves the UDP sockets (DISCO, STUN) */
         { ml_net_io_task,  "ml_net_io",  ML_TASK_NET_IO_STACK,  ML_TASK_NET_IO_PRIO,  ML_TASK_NET_IO_CORE,  ML_TASK_BIT_NET_IO },
+#endif
+#if ML_LITE_TASKS
+        /* DERP I/O + WireGuard manager in one task: it owns both bits */
+        { ml_tunnel_task,  "ml_tunnel",  ML_TASK_TUNNEL_STACK,  ML_TASK_TUNNEL_PRIO,  ML_TASK_TUNNEL_CORE,
+          ML_TASK_BIT_DERP_TX | ML_TASK_BIT_WG_MGR },
+#else
         { ml_derp_tx_task, "ml_derp_tx", ML_TASK_DERP_TX_STACK, ML_TASK_DERP_TX_PRIO, ML_TASK_DERP_TX_CORE, ML_TASK_BIT_DERP_TX },
+#endif
         { ml_coord_task,   "ml_coord",   ML_TASK_COORD_STACK,   ML_TASK_COORD_PRIO,   ML_TASK_COORD_CORE,   ML_TASK_BIT_COORD },
+#if !ML_LITE_TASKS
         { ml_wg_mgr_task,  "ml_wg_mgr",  ML_TASK_WG_MGR_STACK,  ML_TASK_WG_MGR_PRIO,  ML_TASK_WG_MGR_CORE,  ML_TASK_BIT_WG_MGR },
+#endif
     };
-    TaskHandle_t *handles[] = { &ml->net_io_task, &ml->derp_tx_task, &ml->coord_task, &ml->wg_mgr_task };
+    TaskHandle_t *handles[] = {
+#if !ML_LITE_NO_DIRECT
+        &ml->net_io_task,
+#endif
+        &ml->derp_tx_task,      /* ML_LITE_TASKS: the tunnel task, which also
+                                 * sets wg_mgr_task to itself */
+        &ml->coord_task,
+#if !ML_LITE_TASKS
+        &ml->wg_mgr_task,
+#endif
+    };
+    _Static_assert(sizeof(handles) / sizeof(handles[0]) == sizeof(tasks) / sizeof(tasks[0]),
+                   "one handle per task");
 
     for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
         __atomic_fetch_or(&ml->tasks_alive, tasks[i].bit, __ATOMIC_RELEASE);
@@ -834,6 +884,7 @@ esp_err_t microlink_rebind(microlink_t *ml) {
     }
     ESP_LOGW(TAG, "Rebind: zero-copy init failed, using BSD socket fallback");
 #endif
+#if !ML_LITE_NO_DIRECT
     ml->disco_sock4 = ml_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (ml->disco_sock4 >= 0) {
         struct sockaddr_in bind_addr = {
@@ -858,6 +909,7 @@ esp_err_t microlink_rebind(microlink_t *ml) {
     } else {
         ESP_LOGE(TAG, "Rebind: failed to create DISCO socket: errno=%d", errno);
     }
+#endif /* !ML_LITE_NO_DIRECT */
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 rebind_wg_update:
@@ -998,6 +1050,12 @@ static bool lan_netif_up(esp_netif_t *netif, void *arg) {
 }
 
 bool ml_lan_ipv4(uint32_t *ip_out) {
+#if ML_LITE_NO_DIRECT
+    /* No UDP socket to reach us on: advertise no Local endpoint, so peers
+     * never try a direct path. */
+    (void)ip_out;
+    return false;
+#endif
     esp_netif_t *netif = esp_netif_get_default_netif();
     if (!netif || !lan_netif_up(netif, NULL)) netif = esp_netif_find_if(lan_netif_up, NULL);
     esp_netif_ip_info_t info;

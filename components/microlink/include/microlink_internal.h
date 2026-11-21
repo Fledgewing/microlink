@@ -16,6 +16,7 @@
 #pragma once
 
 #include "microlink.h"
+#include "ml_lite.h"
 #include "ml_config_httpd.h"
 #include "ml_routes.h"
 #include "sdkconfig.h"
@@ -37,6 +38,9 @@
 #define ML_TLS_LEGACY_RNG 0
 #endif
 #include "esp_heap_caps.h"
+#if ML_LITE_TASKS
+#include <unistd.h>     /* write() in ml_wg_mgr_wake */
+#endif
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 #include "lwip/udp.h"
@@ -62,7 +66,13 @@ extern "C" {
 #define ML_TASK_APP_CORE        1
 #endif
 
+#if ML_LITE_TASKS
+/* Only created when the direct path is on (!ML_LITE_NO_DIRECT). Its frame is
+ * ~1.8 KB (the receive buffer); recvfrom + a log line add ~2 KB. */
+#define ML_TASK_NET_IO_STACK    (4 * 1024 + 512)
+#else
 #define ML_TASK_NET_IO_STACK    (8 * 1024)
+#endif
 #define ML_TASK_NET_IO_PRIO     7
 #define ML_TASK_NET_IO_CORE     0
 
@@ -77,6 +87,22 @@ extern "C" {
 #define ML_TASK_WG_MGR_STACK    (8 * 1024)
 #define ML_TASK_WG_MGR_PRIO     7
 #define ML_TASK_WG_MGR_CORE     ML_TASK_APP_CORE
+
+/* ML_LITE_TASKS: DERP I/O and the WireGuard manager run as one task
+ * (ml_tunnel_task in ml_wg_mgr.c), so the TLS handshake and the WireGuard
+ * crypto take turns on one stack instead of each needing its own. Worst
+ * static call path (objdump of the C3 firmware, direct calls, with the
+ * TailnetLog esp_log wrapper at the deepest point): ~6.0 KB through the DERP
+ * TLS handshake's certificate check (derp_conn_open 1 KB + RSA-PSS verify
+ * 1.2 KB + SHA DMA + a log line 1.7 KB); the WireGuard side is ~4 KB. 8 KB
+ * leaves ~2 KB for indirect calls the analysis can't follow and interrupt
+ * frames. The task logs its stack high-water mark once DERP is up and at
+ * exit ("ml_tunnel stack: N bytes never used"). */
+#ifndef ML_TASK_TUNNEL_STACK
+#define ML_TASK_TUNNEL_STACK    (8 * 1024)
+#endif
+#define ML_TASK_TUNNEL_PRIO     ML_TASK_WG_MGR_PRIO
+#define ML_TASK_TUNNEL_CORE     ML_TASK_DERP_TX_CORE
 
 // Was a bare `configMAX_PRIORITIES - 2` literal at the ml_udp.c call
 // site - numerically identical to ESP-IDF's own ESP_TASK_BT_CONTROLLER_PRIO
@@ -93,20 +119,45 @@ extern "C" {
 #define ML_TASK_UDP_RX_PRIO     CONFIG_ML_UDP_RX_TASK_PRIO
 
 /* Queue depths */
+#if ML_LITE_TASKS
+/* One task both fills wg_rx/disco_rx (DERP reads, at most 4 frames a pass)
+ * and drains them in the same pass, and it drains peer updates from the
+ * start (not only after registration), so these only need to cover a burst.
+ * DERP TX is filled by WireGuard output on the tcpip thread. */
+#define ML_DERP_TX_QUEUE_DEPTH  8
+#define ML_WG_RX_QUEUE_DEPTH    8
+#define ML_PEER_UPDATE_QUEUE_DEPTH 32
+#else
 #define ML_DERP_TX_QUEUE_DEPTH  16
+#endif
+#if ML_LITE_NO_DIRECT
+/* DISCO only arrives over DERP (pings from peers); no STUN replies at all,
+ * but coord still reads the queue, so it exists. */
+#define ML_DISCO_RX_QUEUE_DEPTH 4
+#define ML_STUN_RX_QUEUE_DEPTH  1
+#else
 #define ML_DISCO_RX_QUEUE_DEPTH 16
+#define ML_STUN_RX_QUEUE_DEPTH  4
+#endif
+#ifndef ML_WG_RX_QUEUE_DEPTH
 /* Deep enough to hold a TCP window's worth of packets while the manager task
  * is busy with a handshake or a DISCO probe round. The enqueue in
  * ml_net_io.c is non-blocking, so an overflow here is a silent drop; at 8 a
  * bulk transfer lost enough packets to collapse TCP. Each slot holds a
  * pointer and a few fields, not the packet. */
 #define ML_WG_RX_QUEUE_DEPTH    64
-#define ML_STUN_RX_QUEUE_DEPTH  4
+#endif
 #define ML_COORD_CMD_QUEUE_DEPTH 4
+#ifndef ML_PEER_UPDATE_QUEUE_DEPTH
 #define ML_PEER_UPDATE_QUEUE_DEPTH 400
+#endif
 
 /* Protocol limits */
+#if ML_LITE_CONTEXT && CONFIG_ML_MAX_PEERS > ML_LITE_MAX_PEERS
+#define ML_MAX_PEERS            ML_LITE_MAX_PEERS
+#else
 #define ML_MAX_PEERS            CONFIG_ML_MAX_PEERS
+#endif
 #define ML_MAX_ENDPOINTS        8
 #define ML_MAX_PACKET_SIZE      1500
 #define ML_DERP_MAX_FRAME       (ML_MAX_PACKET_SIZE + 64)
@@ -391,12 +442,22 @@ typedef struct {
  * ========================================================================== */
 
 #define ML_MAX_DERP_REGIONS     32
+#if ML_LITE_CONTEXT
+/* The DERP connect uses a region's first DERP node; a second covers a
+ * STUN-only first node. IPv6 addresses are only logged: kept as "". With
+ * these the 32 regions take ~6 KB instead of ~17 KB, in their own
+ * allocation (microlink_t.derp_regions). */
+#define ML_MAX_DERP_NODES       2
+#define ML_DERP_NODE_IPV6_LEN   1
+#else
 #define ML_MAX_DERP_NODES       4
+#define ML_DERP_NODE_IPV6_LEN   46
+#endif
 
 typedef struct {
     char hostname[64];
     char ipv4[16];
-    char ipv6[46];
+    char ipv6[ML_DERP_NODE_IPV6_LEN];
     uint16_t stun_port;     /* 0 = default 3478 */
     uint16_t derp_port;     /* 0 = default 443 */
     bool stun_only;         /* true if node only serves STUN, not DERP */
@@ -557,7 +618,11 @@ struct microlink_s {
     /* DERP connection (owned exclusively by DERP I/O task after connect) */
     /* Connection setup by coord task, then handed to DERP I/O task */
     ml_derp_conn_t derp;                /* home region */
+#if ML_LITE_CONTEXT && ML_DERP_EXTRA_CONNS == 0
+    ml_derp_conn_t derp_extra[0];       /* none: every loop over it is empty */
+#else
     ml_derp_conn_t derp_extra[ML_DERP_EXTRA_CONNS > 0 ? ML_DERP_EXTRA_CONNS : 1];
+#endif
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
@@ -614,7 +679,13 @@ struct microlink_s {
     bool nat_mapping_varies;        /* true = symmetric NAT (direct won't work) */
 
     /* DERP map (parsed from MapResponse, owned by coord task) */
+#if ML_LITE_CONTEXT
+    /* ML_MAX_DERP_REGIONS entries, allocated with the context: a separate
+     * block keeps each allocation small on a fragmented heap. */
+    ml_derp_region_t *derp_regions;
+#else
     ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];
+#endif
     uint8_t derp_region_count;
     uint16_t derp_home_region;      /* Our PreferredDERP region */
     uint16_t derp_preferred_region; /* lowest-latency region measured (0 = not measured) */
@@ -765,10 +836,23 @@ void ml_coord_task(void *arg);
 
 /* ml_wg_mgr.c */
 void ml_wg_mgr_task(void *arg);
+#if ML_LITE_TASKS
+/* DERP I/O + WireGuard manager in one task (ML_LITE_TASKS). Owns
+ * ML_TASK_BIT_DERP_TX | ML_TASK_BIT_WG_MGR. */
+void ml_tunnel_task(void *arg);
+#endif
 
 /* Wake the wg_mgr task after queueing work for it (safe from any task). */
 static inline void ml_wg_mgr_wake(microlink_t *ml) {
     if (ml && ml->wg_wake) xSemaphoreGive(ml->wg_wake);
+#if ML_LITE_TASKS
+    /* The tunnel task sleeps in select() on the DERP socket and this
+     * eventfd (ml_derp_idle_wait) while DERP is up. */
+    if (ml && ml->derp_wake_fd >= 0) {
+        uint64_t one = 1;
+        (void)write(ml->derp_wake_fd, &one, sizeof(one));
+    }
+#endif
 }
 /* True if wg_mgr last saw a usable WireGuard session to vpn_ip. Reads the
  * table wg_mgr publishes (wg_session_up_ip), so it is safe from any task;

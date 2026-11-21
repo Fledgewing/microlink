@@ -90,7 +90,12 @@ typedef struct {
  * via DERP, and an unanswered probe holds its slot for
  * ML_DISCO_PING_TIMEOUT_MS. When the table is full the oldest probe is
  * evicted (see disco_build_ping). */
+#if ML_LITE_CONTEXT
+/* A couple of peers: 4 probes each (the floor of 64 below is 3 KB of RAM) */
+#define MAX_PENDING_PROBES (ML_MAX_PEERS * 4)
+#else
 #define MAX_PENDING_PROBES ((ML_MAX_PEERS * 4) > 64 ? (ML_MAX_PEERS * 4) : 64)
+#endif
 static disco_probe_t pending_probes[MAX_PENDING_PROBES];
 static uint32_t s_disco_round;
 
@@ -1481,6 +1486,11 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
  * attacker re-send a captured PONG from its own address and become the
  * peer's "direct path". */
 static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
+#if ML_LITE_NO_DIRECT
+    /* DERP only: no UDP socket to ping from or to learn a path on */
+    (void)ml; (void)peer_idx; (void)force;
+    return;
+#endif
     ml_peer_t *p = &ml->peers[peer_idx];
     uint64_t now = ml_get_time_ms();
 
@@ -2161,6 +2171,11 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
  * ========================================================================== */
 
 static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
+#if ML_LITE_NO_DIRECT
+    /* DERP only: we have no endpoint for the peer to call */
+    (void)ml; (void)peer_idx;
+    return;
+#endif
     ml_peer_t *p = &ml->peers[peer_idx];
 
     /* Build plaintext: [type(1)][version(1)][endpoints(N * 18)] */
@@ -2473,10 +2488,16 @@ static void disco_periodic_probes(microlink_t *ml) {
  * WG Manager Task
  * ========================================================================== */
 
-void ml_wg_mgr_task(void *arg) {
-    microlink_t *ml = (microlink_t *)arg;
-    ESP_LOGI(TAG, "WG Manager task started (Core %d)", xPortGetCoreID());
+/* Loop state of the WireGuard manager (wg_mgr task, or the tunnel task) */
+typedef struct {
+    uint64_t last_disco_probe_ms;
+    uint64_t last_wg_periodic_ms;
+    uint64_t last_session_publish_ms;
+    bool derp_was_connected;
+    bool stun_cmm_sent;  /* One-shot: send CMMs after first STUN result */
+} wg_mgr_loop_t;
 
+static void wg_mgr_begin(microlink_t *ml) {
     /* Initialize probe tracking (module statics survive a stop/start) */
     memset(pending_probes, 0, sizeof(pending_probes));
     s_disco_round = 0;
@@ -2488,17 +2509,11 @@ void ml_wg_mgr_task(void *arg) {
         ml->peer_count = cached;
         ESP_LOGI(TAG, "Pre-loaded %d cached peers from NVS", cached);
     }
+}
 
-    /* Wait for registration OR shutdown before proceeding */
-    EventBits_t wait_bits = xEventGroupWaitBits(ml->events,
-                         ML_EVT_COORD_REGISTERED | ML_EVT_SHUTDOWN_REQUEST,
-                         pdFALSE, pdFALSE, portMAX_DELAY);
-
-    if (wait_bits & ML_EVT_SHUTDOWN_REQUEST) {
-        ESP_LOGI(TAG, "Shutdown requested before registration, exiting");
-        ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
-    }
-
+/* Once registered: bring up the WireGuard interface. noinline keeps its
+ * locals off the frame of the loop that calls it. */
+static __attribute__((noinline)) void wg_mgr_up(microlink_t *ml) {
     ESP_LOGI(TAG, "Coord registered, initializing WireGuard...");
 
     /* Initialize WireGuard interface (magicsock mode) */
@@ -2511,137 +2526,131 @@ void ml_wg_mgr_task(void *arg) {
     }
 
     ESP_LOGI(TAG, "Accepting peer updates");
+}
 
-    uint64_t last_disco_probe_ms = 0;
-    uint64_t last_wg_periodic_ms = 0;
-    uint64_t last_session_publish_ms = 0;
-    bool derp_was_connected = false;
-    bool stun_cmm_sent = false;  /* One-shot: send CMMs after first STUN result */
+/* First half of a pass: peer updates, DERP state, CallMeMaybe after STUN,
+ * DISCO packets. */
+static __attribute__((noinline)) void wg_mgr_step_control(microlink_t *ml, wg_mgr_loop_t *st) {
+    /* Process peer updates from coord task (and app-side requests) */
+    process_peer_updates(ml);
+    cmm_sweep_step(ml);
 
-    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
-        /* Process peer updates from coord task (and app-side requests) */
-        process_peer_updates(ml);
-        cmm_sweep_step(ml);
-
-        /* Track DERP connection state for DISCO.
-         * Note: We DON'T re-initiate WG handshakes on DERP connect because
-         * Tailscale peers use lazy config and would drop our initiations.
-         * WG sessions are established on-demand when peers initiate to us. */
-        {
-            EventBits_t bits = xEventGroupGetBits(ml->events);
-            bool derp_connected_now = (bits & ML_EVT_DERP_CONNECTED) != 0;
-            if (derp_connected_now && !derp_was_connected) {
-                ESP_LOGI(TAG, "DERP connected, %d peers ready for incoming handshakes",
-                         ml->peer_count);
-            }
-            derp_was_connected = derp_connected_now;
+    /* Track DERP connection state for DISCO.
+     * Note: We DON'T re-initiate WG handshakes on DERP connect because
+     * Tailscale peers use lazy config and would drop our initiations.
+     * WG sessions are established on-demand when peers initiate to us. */
+    {
+        EventBits_t bits = xEventGroupGetBits(ml->events);
+        bool derp_connected_now = (bits & ML_EVT_DERP_CONNECTED) != 0;
+        if (derp_connected_now && !st->derp_was_connected) {
+            ESP_LOGI(TAG, "DERP connected, %d peers ready for incoming handshakes",
+                     ml->peer_count);
         }
-
-        /* After STUN completes, broadcast CallMeMaybe to all peers.
-         * Peers need to know our public endpoint (from STUN) to send direct
-         * probes. Without this, our initial CMMs during peer-add have 0
-         * endpoints because STUN hasn't finished yet. */
-        if (!stun_cmm_sent && !ml_at_socket_is_ready() &&
-            ml->stun_public_ip != 0 && ml->peer_count > 0) {
-            stun_cmm_sent = true;
-            int cmm_count = 0;
-            for (int i = 0; i < ml->peer_count; i++) {
-                if (!ml->peers[i].active) continue;
-                if (ml->peers[i].has_direct_path) continue;
-                disco_send_call_me_maybe(ml, i);
-                cmm_count++;
-            }
-            ESP_LOGI(TAG, "STUN complete — sent CallMeMaybe to %d peers", cmm_count);
-        }
-
-        /* Process DISCO packets */
-#ifdef CONFIG_ML_ZERO_COPY_WG
-        /* Zero-copy mode: drain SPSC ring buffer (PCB callback → wg_mgr) */
-        {
-            uint8_t tail = __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_RELAXED);
-            uint8_t head = __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE);
-            while (tail != head) {
-                ml_zc_disco_entry_t *entry = &ml->zc.rx_ring[tail];
-                ml_rx_packet_t disco_pkt = {
-                    .data = entry->data,
-                    .len = entry->len,
-                    .src_ip = ntohl(entry->src_ip_nbo),
-                    .src_port = entry->src_port,
-                    .via_derp = false,
-                };
-                process_disco_packet(ml, &disco_pkt);
-                /* Don't free — data is in the ring buffer, not heap-allocated */
-                tail = (tail + 1) % ML_ZC_DISCO_RING_SIZE;
-                head = __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE);
-            }
-            __atomic_store_n(&ml->zc.rx_tail, tail, __ATOMIC_RELEASE);
-        }
-#endif
-        /* Queue-based path: DISCO from DERP relay + fallback when zero-copy disabled */
-        ml_rx_packet_t disco_pkt;
-        while (xQueueReceive(ml->disco_rx_queue, &disco_pkt, 0) == pdTRUE) {
-            process_disco_packet(ml, &disco_pkt);
-            free(disco_pkt.data);
-        }
-
-        /* Idle wait: block until a producer signals work (WG/DISCO packet,
-         * peer update or request; see ml_wg_mgr_wake) or the periodic tick.
-         * This replaces a fixed 10 ms poll (100 wakeups/s while idle). A give
-         * between the emptiness check and the take is not lost: the binary
-         * semaphore stays given. */
-        if (uxQueueMessagesWaiting(ml->wg_rx_queue) == 0 &&
-            uxQueueMessagesWaiting(ml->disco_rx_queue) == 0 &&
-            uxQueueMessagesWaiting(ml->peer_update_queue) == 0
-#ifdef CONFIG_ML_ZERO_COPY_WG
-            && __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_RELAXED) ==
-               __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE)
-#endif
-            ) {
-            xSemaphoreTake(ml->wg_wake, pdMS_TO_TICKS(ML_WG_IDLE_TICK_MS));
-        }
-
-        /* Process WireGuard packets */
-        ml_rx_packet_t wg_pkt;
-        bool wg_rx = false;
-        if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
-            wg_rx = true;
-            process_wg_packet(ml, &wg_pkt);
-            while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
-                process_wg_packet(ml, &wg_pkt);
-            }
-        }
-
-        /* Run WireGuard periodic processing (handshakes, keepalives, rekeys).
-         * This runs on OUR task stack (8KB) instead of the lwIP TCPIP thread (3-8KB),
-         * preventing heavy crypto (X25519, ChaCha20-Poly1305) from monopolizing
-         * the TCPIP thread and blocking all socket operations system-wide. */
-        uint64_t now = ml_get_time_ms();
-        if (wg_rx || now - last_session_publish_ms >= 100) {
-            wg_publish_session_state(ml);
-            last_session_publish_ms = now;
-        }
-        if (ml->wg_netif && now - last_wg_periodic_ms >= 400) {
-            uint64_t t0 = now;
-            wireguardif_periodic((struct netif *)ml->wg_netif);
-            uint64_t dt = ml_get_time_ms() - t0;
-            last_wg_periodic_ms = now;
-            ESP_LOGD(TAG, "wireguardif_periodic: %lu ms", (unsigned long)dt);
-        }
-
-        /* Periodic DISCO probes (every 1s check) */
-        now = ml_get_time_ms();
-        if (now - last_disco_probe_ms > 1000) {
-            uint64_t t0 = now;
-            disco_periodic_probes(ml);
-            uint64_t dt = ml_get_time_ms() - t0;
-            last_disco_probe_ms = now;
-            ESP_LOGD(TAG, "disco_periodic_probes: %lu ms", (unsigned long)dt);
-        }
-
-        /* No trailing delay: the blocking receive above paces the loop and
-         * yields whenever there is nothing to do. */
+        st->derp_was_connected = derp_connected_now;
     }
 
+    /* After STUN completes, broadcast CallMeMaybe to all peers.
+     * Peers need to know our public endpoint (from STUN) to send direct
+     * probes. Without this, our initial CMMs during peer-add have 0
+     * endpoints because STUN hasn't finished yet. */
+    if (!st->stun_cmm_sent && !ml_at_socket_is_ready() &&
+        ml->stun_public_ip != 0 && ml->peer_count > 0) {
+        st->stun_cmm_sent = true;
+        int cmm_count = 0;
+        for (int i = 0; i < ml->peer_count; i++) {
+            if (!ml->peers[i].active) continue;
+            if (ml->peers[i].has_direct_path) continue;
+            disco_send_call_me_maybe(ml, i);
+            cmm_count++;
+        }
+        ESP_LOGI(TAG, "STUN complete — sent CallMeMaybe to %d peers", cmm_count);
+    }
+
+    /* Process DISCO packets */
+#ifdef CONFIG_ML_ZERO_COPY_WG
+    /* Zero-copy mode: drain SPSC ring buffer (PCB callback → wg_mgr) */
+    {
+        uint8_t tail = __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_RELAXED);
+        uint8_t head = __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE);
+        while (tail != head) {
+            ml_zc_disco_entry_t *entry = &ml->zc.rx_ring[tail];
+            ml_rx_packet_t disco_pkt = {
+                .data = entry->data,
+                .len = entry->len,
+                .src_ip = ntohl(entry->src_ip_nbo),
+                .src_port = entry->src_port,
+                .via_derp = false,
+            };
+            process_disco_packet(ml, &disco_pkt);
+            /* Don't free — data is in the ring buffer, not heap-allocated */
+            tail = (tail + 1) % ML_ZC_DISCO_RING_SIZE;
+            head = __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE);
+        }
+        __atomic_store_n(&ml->zc.rx_tail, tail, __ATOMIC_RELEASE);
+    }
+#endif
+    /* Queue-based path: DISCO from DERP relay + fallback when zero-copy disabled */
+    ml_rx_packet_t disco_pkt;
+    while (xQueueReceive(ml->disco_rx_queue, &disco_pkt, 0) == pdTRUE) {
+        process_disco_packet(ml, &disco_pkt);
+        free(disco_pkt.data);
+    }
+}
+
+/* True if a producer has queued work for the manager. */
+static bool wg_mgr_has_work(microlink_t *ml) {
+    return uxQueueMessagesWaiting(ml->wg_rx_queue) != 0 ||
+           uxQueueMessagesWaiting(ml->disco_rx_queue) != 0 ||
+           uxQueueMessagesWaiting(ml->peer_update_queue) != 0
+#ifdef CONFIG_ML_ZERO_COPY_WG
+           || __atomic_load_n(&ml->zc.rx_tail, __ATOMIC_RELAXED) !=
+              __atomic_load_n(&ml->zc.rx_head, __ATOMIC_ACQUIRE)
+#endif
+           ;
+}
+
+/* Second half of a pass: WireGuard packets, WireGuard timers, DISCO probes. */
+static __attribute__((noinline)) void wg_mgr_step_data(microlink_t *ml, wg_mgr_loop_t *st) {
+    /* Process WireGuard packets */
+    ml_rx_packet_t wg_pkt;
+    bool wg_rx = false;
+    if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+        wg_rx = true;
+        process_wg_packet(ml, &wg_pkt);
+        while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
+            process_wg_packet(ml, &wg_pkt);
+        }
+    }
+
+    /* Run WireGuard periodic processing (handshakes, keepalives, rekeys).
+     * This runs on OUR task stack (8KB) instead of the lwIP TCPIP thread (3-8KB),
+     * preventing heavy crypto (X25519, ChaCha20-Poly1305) from monopolizing
+     * the TCPIP thread and blocking all socket operations system-wide. */
+    uint64_t now = ml_get_time_ms();
+    if (wg_rx || now - st->last_session_publish_ms >= 100) {
+        wg_publish_session_state(ml);
+        st->last_session_publish_ms = now;
+    }
+    if (ml->wg_netif && now - st->last_wg_periodic_ms >= 400) {
+        uint64_t t0 = now;
+        wireguardif_periodic((struct netif *)ml->wg_netif);
+        uint64_t dt = ml_get_time_ms() - t0;
+        st->last_wg_periodic_ms = now;
+        ESP_LOGD(TAG, "wireguardif_periodic: %lu ms", (unsigned long)dt);
+    }
+
+    /* Periodic DISCO probes (every 1s check) */
+    now = ml_get_time_ms();
+    if (now - st->last_disco_probe_ms > 1000) {
+        uint64_t t0 = now;
+        disco_periodic_probes(ml);
+        uint64_t dt = ml_get_time_ms() - t0;
+        st->last_disco_probe_ms = now;
+        ESP_LOGD(TAG, "disco_periodic_probes: %lu ms", (unsigned long)dt);
+    }
+}
+
+static void wg_mgr_end(microlink_t *ml) {
     /* Shutdown WireGuard interface */
     wg_teardown_interface(ml);
     for (int i = 0; i < ML_MAX_PEERS; i++) {
@@ -2651,7 +2660,161 @@ void ml_wg_mgr_task(void *arg) {
      * cache's copy of our disco private key, which would otherwise outlive
      * microlink_destroy() in static RAM. */
     nacl_box_shared_cache_wipe();
+}
+
+void ml_wg_mgr_task(void *arg) {
+    microlink_t *ml = (microlink_t *)arg;
+    ESP_LOGI(TAG, "WG Manager task started (Core %d)", xPortGetCoreID());
+
+    wg_mgr_begin(ml);
+
+    /* Wait for registration OR shutdown before proceeding */
+    EventBits_t wait_bits = xEventGroupWaitBits(ml->events,
+                         ML_EVT_COORD_REGISTERED | ML_EVT_SHUTDOWN_REQUEST,
+                         pdFALSE, pdFALSE, portMAX_DELAY);
+
+    if (wait_bits & ML_EVT_SHUTDOWN_REQUEST) {
+        ESP_LOGI(TAG, "Shutdown requested before registration, exiting");
+        ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
+    }
+
+    wg_mgr_up(ml);
+
+    wg_mgr_loop_t st = {0};
+    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
+        wg_mgr_step_control(ml, &st);
+
+        /* Idle wait: block until a producer signals work (WG/DISCO packet,
+         * peer update or request; see ml_wg_mgr_wake) or the periodic tick.
+         * This replaces a fixed 10 ms poll (100 wakeups/s while idle). A give
+         * between the emptiness check and the take is not lost: the binary
+         * semaphore stays given. */
+        if (!wg_mgr_has_work(ml)) {
+            xSemaphoreTake(ml->wg_wake, pdMS_TO_TICKS(ML_WG_IDLE_TICK_MS));
+        }
+
+        wg_mgr_step_data(ml, &st);
+
+        /* No trailing delay: the blocking receive above paces the loop and
+         * yields whenever there is nothing to do. */
+    }
+
+    wg_mgr_end(ml);
 
     ESP_LOGI(TAG, "WG Manager task exiting");
     ml_task_exit(ml, ML_TASK_BIT_WG_MGR);
 }
+
+#if ML_LITE_TASKS
+/* ============================================================================
+ * Tunnel task (ML_LITE_TASKS): DERP I/O + WireGuard manager in one task
+ *
+ * The DERP side (TLS connect, frame reads and writes) and the manager side
+ * (peers, DISCO, WireGuard) take turns in one loop, so the deepest stack of
+ * either (the DERP TLS handshake) is paid once instead of on two tasks. A
+ * DERP frame read in a pass is handed to WireGuard in the same pass, which
+ * is why the receive queues can be short.
+ *
+ * Differences from the two-task layout:
+ * - Peer updates are taken from the start, not only after registration: the
+ *   short peer queue would otherwise overflow while coord parses the first
+ *   netmap. Peers added before the WireGuard interface exists go into the
+ *   table only and are installed into WireGuard by wg_install_table_peers().
+ * - While the DERP connect blocks (DNS + TLS, seconds), the manager does not
+ *   run; there is no tunnel without DERP in this mode anyway.
+ * ========================================================================== */
+
+/* Install into WireGuard every table peer that has no WireGuard slot yet
+ * (added before the interface existed, or preloaded from NVS), by replaying
+ * it as an add: add_peer() re-adds a known peer without a slot in place. */
+static __attribute__((noinline)) void wg_install_table_peers(microlink_t *ml) {
+    if (!ml->wg_netif) return;
+    ml_peer_update_t *u = malloc(sizeof(*u));
+    if (!u) return;
+    for (int i = 0; i < ml->peer_count; i++) {
+        const ml_peer_t *p = &ml->peers[i];
+        if (!p->active || p->wg_peer_index >= 0) continue;
+        memset(u, 0, sizeof(*u));
+        u->action = ML_PEER_ADD;
+        u->node_id = p->node_id;
+        u->netmap_gen = p->netmap_gen;
+        u->key_valid = true;
+        u->disco_valid = true;
+        u->vpn_ip = p->vpn_ip;
+        u->has_ip6 = p->has_ip6;
+        memcpy(u->vpn_ip6, p->vpn_ip6, 16);
+        memcpy(u->public_key, p->public_key, 32);
+        memcpy(u->disco_key, p->disco_key, 32);
+        strlcpy(u->hostname, p->hostname, sizeof(u->hostname));
+        u->derp_region = p->derp_region;
+        u->endpoint_count = p->endpoint_count;
+        for (int e = 0; e < p->endpoint_count && e < ML_MAX_ENDPOINTS; e++) {
+            u->endpoints[e].ip = p->endpoints[e].ip;
+            u->endpoints[e].port = p->endpoints[e].port;
+            u->endpoints[e].is_ipv6 = p->endpoints[e].is_ipv6;
+        }
+        u->online = p->online;
+        u->online_valid = true;
+        add_peer(ml, u);
+    }
+    free(u);
+}
+
+static void tunnel_log_stack(const char *when) {
+    ESP_LOGI(TAG, "ml_tunnel stack: %u of %u bytes never used (%s)",
+             (unsigned)uxTaskGetStackHighWaterMark(NULL), (unsigned)ML_TASK_TUNNEL_STACK, when);
+}
+
+void ml_tunnel_task(void *arg) {
+    microlink_t *ml = (microlink_t *)arg;
+    ml->wg_mgr_task = xTaskGetCurrentTaskHandle();   /* ml->derp_tx_task: set by create */
+    ESP_LOGI(TAG, "Tunnel task (DERP + WireGuard) started (Core %d, %u-byte stack)",
+             xPortGetCoreID(), (unsigned)ML_TASK_TUNNEL_STACK);
+
+    ml_derp_io_t io;
+    ml_derp_io_begin(ml, &io);
+    wg_mgr_begin(ml);
+
+    wg_mgr_loop_t st = {0};
+    bool wg_up = false;
+    bool stack_logged = false;
+    while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
+        ml_derp_step_t ds = ml_derp_io_step(ml, &io);
+
+        if (!wg_up && (xEventGroupGetBits(ml->events) & ML_EVT_COORD_REGISTERED)) {
+            process_peer_updates(ml);   /* the rest of the first netmap */
+            wg_mgr_up(ml);
+            wg_install_table_peers(ml);
+            wg_up = true;
+        }
+        if (wg_up) {
+            wg_mgr_step_control(ml, &st);
+            wg_mgr_step_data(ml, &st);
+        } else {
+            process_peer_updates(ml);   /* table only, see above */
+        }
+
+        if (!stack_logged && ml->derp.connected && wg_up) {
+            tunnel_log_stack("DERP up");
+            stack_logged = true;
+        }
+
+        if (ds == ML_DERP_STEP_AGAIN || (wg_up && wg_mgr_has_work(ml))) continue;
+        if (ds == ML_DERP_STEP_IDLE) {
+            /* select() on the DERP socket and the wake eventfd, which both
+             * ml_derp_queue_send() and ml_wg_mgr_wake() signal */
+            ml_derp_idle_wait(ml, ML_WG_IDLE_TICK_MS);
+        } else {
+            /* No DERP connection: producers still give wg_wake */
+            xSemaphoreTake(ml->wg_wake, pdMS_TO_TICKS(ML_WG_IDLE_TICK_MS));
+        }
+    }
+
+    wg_mgr_end(ml);
+    ml_derp_io_end(ml);
+    tunnel_log_stack("exit");
+
+    ESP_LOGI(TAG, "Tunnel task exiting");
+    ml_task_exit(ml, ML_TASK_BIT_DERP_TX | ML_TASK_BIT_WG_MGR);
+}
+#endif /* ML_LITE_TASKS */
