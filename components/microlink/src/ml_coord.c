@@ -2083,7 +2083,12 @@ static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
 
     /* Parse KeyExpiry (ISO 8601: "YYYY-MM-DDTHH:MM:SSZ") */
     cJSON *key_expiry = cJSON_GetObjectItem(node, "KeyExpiry");
-    if (key_expiry && key_expiry->valuestring) {
+    /* Absent, or Go's zero time "0001-01-01T00:00:00Z" (key expiry disabled
+     * for this node): the key does not expire (key_expiry_epoch 0). */
+    ESP_LOGI(TAG, "KeyExpiry (raw): %s", key_expiry && key_expiry->valuestring ? key_expiry->valuestring : "(absent)");
+    if (key_expiry && key_expiry->valuestring && strncmp(key_expiry->valuestring, "0001-", 5) == 0) {
+        ml->key_expiry_epoch = 0;
+    } else if (key_expiry && key_expiry->valuestring) {
         int yr, mo, dy, hr, mn, sc;
         if (sscanf(key_expiry->valuestring, "%d-%d-%dT%d:%d:%d",
                    &yr, &mo, &dy, &hr, &mn, &sc) >= 6 &&
@@ -3793,18 +3798,28 @@ static void ctl_cache_save(microlink_t *ml) {
         if (nvs_set_blob(h, CTL_CACHE_KEY, &c, sizeof(c)) == ESP_OK) nvs_commit(h);
     }
     nvs_close(h);
-    ESP_LOGI(TAG, "Control state cached%s: relay region %u (%s), key expires in %ld h",
-             same ? " (unchanged)" : "", (unsigned)region, c.host,
-             c.key_expiry ? ctl_key_hours_left(c.key_expiry) : -1L);
+    if (c.key_expiry) {
+        /* -1 h: the clock is not set, so the hours left are unknown */
+        ESP_LOGI(TAG, "Control state cached%s: relay region %u (%s), key expires in %ld h (epoch %lld)",
+                 same ? " (unchanged)" : "", (unsigned)region, c.host, ctl_key_hours_left(c.key_expiry),
+                 (long long)c.key_expiry);
+    } else {
+        ESP_LOGI(TAG, "Control state cached%s: relay region %u (%s), key does not expire",
+                 same ? " (unchanged)" : "", (unsigned)region, c.host);
+    }
 }
 
-bool ml_ctl_cache_try_start(microlink_t *ml) {
-    char why[64] = "";
+/* Would a cached start work now? Fills c, hours and why (empty when it would). */
+static bool ctl_cache_check(microlink_t *ml, ctl_cache_t *out, long *hours_out, char *why, size_t why_len) {
     ctl_cache_t c;
     long hours = -1;
-    if (s_register_only) return false;   /* the login boot registers */
+    why[0] = 0;
+    if (s_register_only) {
+        snprintf(why, why_len, "login boot");
+        return false;
+    }
     if (!ml->cached_start_peer) {
-        snprintf(why, sizeof(why), "no server peer known yet");
+        snprintf(why, why_len, "no server peer known yet");
     } else {
         nvs_handle_t h;
         size_t len = sizeof(c);
@@ -3814,28 +3829,50 @@ bool ml_ctl_cache_try_start(microlink_t *ml) {
             nvs_close(h);
         }
         if (err != ESP_OK) {
-            snprintf(why, sizeof(why), "no cached state");
+            snprintf(why, why_len, "no cached state");
         } else if (len != sizeof(c) || c.version != CTL_CACHE_VER) {
-            snprintf(why, sizeof(why), "cached state from another version");
+            snprintf(why, why_len, "cached state from another version");
         } else if (memcmp(c.node_key, ml->wg_public_key, 32) != 0) {
-            snprintf(why, sizeof(why), "node key changed");
+            snprintf(why, why_len, "node key changed");
         } else if (!c.vpn_ip || !c.host[0] || !c.region) {
-            snprintf(why, sizeof(why), "cached state incomplete");
+            snprintf(why, why_len, "cached state incomplete");
         } else if (ml->derp_forced_region && ml->derp_forced_region != c.region) {
-            snprintf(why, sizeof(why), "relay region %u -> %u", (unsigned)c.region,
+            snprintf(why, why_len, "relay region %u -> %u", (unsigned)c.region,
                      (unsigned)ml->derp_forced_region);
         } else if (!ml_peer_nvs_has(ml->cached_start_peer)) {
-            snprintf(why, sizeof(why), "server peer not in the peer cache");
+            snprintf(why, why_len, "server peer not in the peer cache");
         } else if (c.key_expiry) {
             hours = ctl_key_hours_left(c.key_expiry);
             if (hours < 0 && (int64_t)time(NULL) < CTL_CLOCK_SANE) {
-                snprintf(why, sizeof(why), "clock not set (key expiry unknown)");
+                snprintf(why, why_len, "clock not set (key expiry unknown)");
             } else if (c.key_expiry - (int64_t)time(NULL) < ML_CACHED_KEY_MARGIN_S) {
-                snprintf(why, sizeof(why), "node key expires in %ld h", hours);
+                snprintf(why, why_len, "node key expires in %ld h", hours);
             }
         }
     }
-    if (why[0]) {
+    if (why[0]) return false;
+    *out = c;
+    *hours_out = hours;
+    return true;
+}
+
+bool microlink_control_cache_usable(microlink_t *ml) {
+    if (!ml) return false;
+    char why[64];
+    ctl_cache_t c = {0};
+    long hours = -1;
+    const bool ok = ctl_cache_check(ml, &c, &hours, why, sizeof(why));
+    ESP_LOGI(TAG, "Cached start %s%s%s", ok ? "possible" : "not possible: ", ok ? "" : why,
+             ok ? (c.key_expiry ? "" : " (key does not expire)") : "");
+    return ok;
+}
+
+bool ml_ctl_cache_try_start(microlink_t *ml) {
+    char why[64];
+    ctl_cache_t c;
+    long hours = -1;
+    if (s_register_only) return false;   /* the login boot registers */
+    if (!ctl_cache_check(ml, &c, &hours, why, sizeof(why))) {
         ESP_LOGI(TAG, "Control session needed: %s", why);
         return false;
     }
@@ -3883,6 +3920,11 @@ bool ml_ctl_cache_try_start(microlink_t *ml) {
 }
 #else
 bool ml_ctl_cache_try_start(microlink_t *ml) {
+    (void)ml;
+    return false;
+}
+
+bool microlink_control_cache_usable(microlink_t *ml) {
     (void)ml;
     return false;
 }

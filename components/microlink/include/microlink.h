@@ -284,6 +284,13 @@ void microlink_control_register_only(bool on);
  */
 void microlink_cached_start_peer(microlink_t *ml, uint32_t vpn_ip, bool auto_fallback);
 
+/**
+ * Would microlink_start() skip the control session (ML_LITE_CACHED_START)?
+ * Runs the same checks against the cached state; call after microlink_init()
+ * and microlink_cached_start_peer(), before microlink_start(). Logs the answer.
+ */
+bool microlink_control_cache_usable(microlink_t *ml);
+
 /** True while this run is on cached control state (no session has run yet). */
 bool microlink_control_cached(const microlink_t *ml);
 
