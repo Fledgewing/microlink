@@ -569,7 +569,9 @@ static esp_err_t derp_tls_start(microlink_t *ml, ml_derp_conn_t *c, int sock,
     c->wctx = ctx;
     /* No resumption: the client session cache is global and unlocked
      * (SINGLE_THREADED), and the application's own TLS uses it. */
+#ifndef NO_SESSION_CACHE  /* without the cache there is nothing to turn off */
     wolfSSL_CTX_set_session_cache_mode(ctx, WOLFSSL_SESS_CACHE_OFF);
+#endif
 #if CONFIG_ML_DERP_VERIFY_CERT
     int lret = wolfSSL_CTX_load_verify_buffer(ctx, k_derp_root_isrg_x2,
                                               sizeof(k_derp_root_isrg_x2),
