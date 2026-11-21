@@ -2000,10 +2000,76 @@ static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
     }
 }
 
+#if ML_LITE_CONTEXT && ML_LITE_DERP_TRIM
+/* ML_LITE_DERP_TRIM: once a session is over and DERP is connected, the
+ * region table (ML_MAX_DERP_REGIONS entries, ~6 KB) shrinks to the regions in
+ * use: our home region and our peers' home regions. The next session's
+ * DERPMap gets the full table back first (derp_table_full()). */
+static int s_derp_cap = ML_MAX_DERP_REGIONS;
+
+static bool derp_region_wanted(const microlink_t *ml, uint16_t id) {
+    if (id == ml->derp_home_region) return true;
+    for (int i = 0; i < ml->peer_count; i++) {
+        if (ml->peers[i].derp_region == id) return true;
+    }
+    return false;
+}
+
+static void derp_table_trim(microlink_t *ml) {
+    if (s_derp_cap < ML_MAX_DERP_REGIONS) return;
+    if (!ml->derp.connected) {
+        ESP_LOGI(TAG, "DERP region table kept: DERP not connected yet");
+        return;
+    }
+    int keep = 0;
+    for (int i = 0; i < ml->derp_region_count; i++) {
+        if (derp_region_wanted(ml, ml->derp_regions[i].region_id)) keep++;
+    }
+    if (keep == 0) return;
+    ml_derp_region_t *small = malloc((size_t)keep * sizeof(ml_derp_region_t));
+    if (!small) return;
+    int n = 0;
+    for (int i = 0; i < ml->derp_region_count && n < keep; i++) {
+        if (derp_region_wanted(ml, ml->derp_regions[i].region_id)) small[n++] = ml->derp_regions[i];
+    }
+    ml_derp_region_t *old = ml->derp_regions;
+    /* Readers index ml->derp_regions below ml->derp_region_count: shrink the
+     * count first, then swap; the old table goes after the tunnel task has
+     * passed its loop at least once. */
+    ml->derp_region_count = n;
+    __atomic_store_n(&ml->derp_regions, small, __ATOMIC_RELEASE);
+    s_derp_cap = n;
+    vTaskDelay(pdMS_TO_TICKS(200));
+    free(old);
+    ESP_LOGI(TAG, "DERP region table trimmed to %d regions: %u bytes back", n,
+             (unsigned)((ML_MAX_DERP_REGIONS - n) * sizeof(ml_derp_region_t)));
+}
+
+/* Before a DERPMap is parsed: the full table again. */
+static void derp_table_full(microlink_t *ml) {
+    if (s_derp_cap >= ML_MAX_DERP_REGIONS) return;
+    ml_derp_region_t *full = calloc(ML_MAX_DERP_REGIONS, sizeof(ml_derp_region_t));
+    if (!full) {
+        ESP_LOGW(TAG, "DERP region table: no memory to grow back; keeping %d regions", s_derp_cap);
+        return;
+    }
+    ml_derp_region_t *old = ml->derp_regions;
+    memcpy(full, old, (size_t)ml->derp_region_count * sizeof(ml_derp_region_t));
+    __atomic_store_n(&ml->derp_regions, full, __ATOMIC_RELEASE);
+    s_derp_cap = ML_MAX_DERP_REGIONS;
+    vTaskDelay(pdMS_TO_TICKS(200));
+    free(old);
+    ESP_LOGI(TAG, "DERP region table back to %d entries", ML_MAX_DERP_REGIONS);
+}
+#define DERP_TABLE_CAP s_derp_cap
+#else
+#define DERP_TABLE_CAP ML_MAX_DERP_REGIONS
+#endif
+
 /* Append one DERPMap region (a value of DERPMap.Regions) to the region
  * table. False when the table is full. */
 static bool parse_derp_region(microlink_t *ml, cJSON *region_obj) {
-    if (ml->derp_region_count >= ML_MAX_DERP_REGIONS) return false;
+    if (ml->derp_region_count >= DERP_TABLE_CAP) return false;
     ml_derp_region_t *r = &ml->derp_regions[ml->derp_region_count];
     memset(r, 0, sizeof(*r));
 
@@ -2082,6 +2148,9 @@ static void parse_derp_map_from_map(microlink_t *ml, cJSON *map_json) {
     cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
     if (!regions) return;
 
+#if ML_LITE_CONTEXT && ML_LITE_DERP_TRIM
+    derp_table_full(ml);
+#endif
     ml->derp_region_count = 0;
     cJSON *region_obj;
     cJSON_ArrayForEach(region_obj, regions) {
@@ -2607,6 +2676,9 @@ static void map_stream_item(void *ctx, ml_map_item_t kind, char *json, size_t le
         return;
     }
     if (kind == ML_MAP_ITEM_DERP_REGIONS_BEGIN) {
+#if ML_LITE_CONTEXT && ML_LITE_DERP_TRIM
+        derp_table_full(ml);
+#endif
         ml->derp_region_count = 0;
         return;
     }
@@ -3383,6 +3455,9 @@ static void oneshot_end_task_unless_requested(microlink_t *ml, ml_noise_state_t 
     free(ml->coord_st.extra_data);
     ml->coord_st.extra_data = NULL;
     ml->coord_st.extra_data_len = 0;
+#if ML_LITE_CONTEXT && ML_LITE_DERP_TRIM
+    derp_table_trim(ml);
+#endif
 
     /* Log before the lock: printf takes a mutex, which asserts inside a
      * critical section (seen on the X3). */

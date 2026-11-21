@@ -47,6 +47,13 @@
 /* Peers tracked with ML_LITE_CONTEXT: the one server the reader talks to,
  * plus a spare. Applies to the peer table, the WireGuard device and the
  * peer queue; never more than CONFIG_ML_MAX_PEERS. */
+/* Trim the DERP region table to the regions in use (home + peers') after
+ * each control session; the next DERPMap grows it back. Off by default
+ * (measurement builds). */
+#ifndef ML_LITE_DERP_TRIM
+#define ML_LITE_DERP_TRIM 0
+#endif
+
 #ifndef ML_LITE_MAX_PEERS
 #define ML_LITE_MAX_PEERS 2
 #endif

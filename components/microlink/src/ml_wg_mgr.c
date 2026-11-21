@@ -2778,6 +2778,7 @@ void ml_tunnel_task(void *arg) {
     wg_mgr_loop_t st = {0};
     bool wg_up = false;
     bool stack_logged = false;
+    bool derp_stack_logged = false;
     while (!(xEventGroupGetBits(ml->events) & ML_EVT_SHUTDOWN_REQUEST)) {
         ml_derp_step_t ds = ml_derp_io_step(ml, &io);
 
@@ -2794,6 +2795,12 @@ void ml_tunnel_task(void *arg) {
             process_peer_updates(ml);   /* table only, see above */
         }
 
+        /* Once right after the DERP TLS handshake (the deepest path, see
+         * ML_TASK_TUNNEL_STACK), once with WireGuard running too. */
+        if (!derp_stack_logged && ml->derp.connected) {
+            tunnel_log_stack("DERP TLS up");
+            derp_stack_logged = true;
+        }
         if (!stack_logged && ml->derp.connected && wg_up) {
             tunnel_log_stack("DERP up");
             stack_logged = true;
