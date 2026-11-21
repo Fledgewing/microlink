@@ -90,3 +90,8 @@ if(CJSON_DIR AND EXISTS "${CJSON_DIR}/cJSON.c")
 else()
   message(WARNING "cJSON not found (set CJSON_DIR or IDF_PATH); skipping packet filter tests")
 endif()
+
+# Streaming MapResponse splitter (ML_LITE_STREAM_MAP; no dependencies).
+add_executable(test_map_stream test_map_stream.c ${ML_SRC}/src/ml_map_stream.c)
+target_include_directories(test_map_stream PRIVATE ${ML_SRC}/src)
+add_test(NAME map_stream COMMAND test_map_stream)

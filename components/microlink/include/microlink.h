@@ -232,6 +232,34 @@ uint32_t microlink_get_vpn_ip(const microlink_t *ml);
 esp_err_t microlink_get_auth_url(microlink_t *ml, char *buf, size_t buf_len);
 
 /**
+ * @brief Run another control session (ML_LITE_CONTROL_ONESHOT builds)
+ *
+ * With ML_LITE_CONTROL_ONESHOT (default with CONFIG_ML_LITE) the control
+ * connection is not kept open: each session registers, fetches one map,
+ * reports this device's endpoints and home relay, closes, and its task
+ * exits. Nothing reconnects by itself after a session succeeded; call this
+ * when the map may be stale, e.g. a peer is missing or a WireGuard
+ * handshake gets no answer. The tunnel keeps running meanwhile and the state
+ * stays ML_STATE_CONNECTED. Returns at once; microlink_control_sessions()
+ * counts sessions that succeeded, microlink_control_busy() is true while
+ * one runs.
+ *
+ * @return ESP_OK (requested), ESP_ERR_INVALID_STATE (not started or
+ *         stopping), ESP_ERR_NO_MEM (no memory for the task),
+ *         ESP_ERR_NOT_SUPPORTED (build keeps a long-poll connection)
+ */
+esp_err_t microlink_control_refresh(microlink_t *ml);
+
+/** True when the build runs control then close (ML_LITE_CONTROL_ONESHOT). */
+bool microlink_control_oneshot(void);
+
+/** True while a control session (the coord task) runs. */
+bool microlink_control_busy(const microlink_t *ml);
+
+/** Number of control sessions that succeeded since boot. */
+uint32_t microlink_control_sessions(void);
+
+/**
  * @brief Your own lwIP IPv6 input hook, when MicroLink forwards IPv6
  *
  * With CONFIG_ML_ROUTER_IPV6, MicroLink implements lwIP's
