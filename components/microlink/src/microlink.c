@@ -290,6 +290,7 @@ static void ml_release_run_resources(microlink_t *ml) {
      * ml_derp_disconnect); these only catch a task that never ran. */
     if (ml->coord_sock >= 0)  { ml_close_sock(ml->coord_sock);  ml->coord_sock = -1; }
     if (ml->derp.sockfd >= 0) { ml_derp_disconnect(ml); }
+    ml_derp_close_extras(ml);
 
     if (ml->wg_netif) {
         /* wg_mgr removes and frees the netif on exit; if it is still here
@@ -515,6 +516,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
     ml->stun_sock = -1;
     ml->stun_sock6 = -1;
     ml->derp.sockfd = -1;
+    for (int i = 0; i < ML_DERP_EXTRA_CONNS; i++) ml->derp_extra[i].sockfd = -1;
     ml->derp_wake_fd = -1;   /* created by the DERP task (eventfd); before any
                               * error path, so ml_release() never closes fd 0 */
 
@@ -913,6 +915,10 @@ esp_err_t microlink_stop(microlink_t *ml) {
         if ((alive & ML_TASK_BIT_DERP_TX) && fd >= 0 && fd != derp_fd_done) {
             ml_unblock_socket(fd);
             derp_fd_done = fd;
+        }
+        /* An extra relay connection being opened blocks the DERP task too. */
+        for (int i = 0; (alive & ML_TASK_BIT_DERP_TX) && i < ML_DERP_EXTRA_CONNS; i++) {
+            if (ml->derp_extra[i].sockfd >= 0) ml_unblock_socket(ml->derp_extra[i].sockfd);
         }
         uint32_t slice = CONFIG_ML_STOP_TIMEOUT_MS - waited;
         if (slice > 2000) slice = 2000;

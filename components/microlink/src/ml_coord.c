@@ -1055,7 +1055,8 @@ static void add_hostinfo(microlink_t *ml, cJSON *root) {
 
     cJSON *netinfo = cJSON_CreateObject();
     if (netinfo) {
-        cJSON_AddNumberToObject(netinfo, "PreferredDERP", ML_DERP_REGION);
+        cJSON_AddNumberToObject(netinfo, "PreferredDERP",
+                                ml->derp_preferred_region ? ml->derp_preferred_region : ML_DERP_REGION);
         if (ml->stun_nat_checked) {
             cJSON_AddBoolToObject(netinfo, "MappingVariesByDestIP", ml->nat_mapping_varies);
         }
@@ -1436,6 +1437,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
             ml->derp_home_region = ML_DERP_REGION;
             ESP_LOGI(TAG, "Home DERP region: %d (default)", ML_DERP_REGION);
         }
+        if (ml->derp_preferred_region) ml->derp_home_region = ml->derp_preferred_region;
         cJSON *self_key = cJSON_GetObjectItem(node, "Key");
         if (self_key && self_key->valuestring) {
             ESP_LOGI(TAG, "Self-Node Key (from server): %s", self_key->valuestring);
@@ -1899,6 +1901,8 @@ static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
         ml->derp_home_region = ML_DERP_REGION;
         ESP_LOGI(TAG, "Home DERP region: %d (default)", ML_DERP_REGION);
     }
+    /* Our measured region wins over the server's echo of an older one. */
+    if (ml->derp_preferred_region) ml->derp_home_region = ml->derp_preferred_region;
     cJSON *self_key = cJSON_GetObjectItem(node, "Key");
     if (self_key && self_key->valuestring) {
         ESP_LOGI(TAG, "Self-Node Key (server): %.40s...", self_key->valuestring);
@@ -3210,6 +3214,18 @@ void ml_coord_task(void *arg) {
             }
 
             xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED);
+
+            /* Pick the closest relay region now that the DERPMap is in. A
+             * change while connected moves our home connection there; the
+             * next MapRequest/endpoint update reports it as PreferredDERP. */
+            {
+                uint16_t had = ml->derp.region;
+                ml_derp_pick_region(ml);
+                if (ml->derp.connected && had && ml->derp_home_region != had) {
+                    ESP_LOGI(TAG, "Home DERP region %d -> %d", had, ml->derp_home_region);
+                    xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+                }
+            }
 
             /* Signal DERP I/O task to connect (connection now owned by I/O task) */
             if (!ml->derp.connected) {

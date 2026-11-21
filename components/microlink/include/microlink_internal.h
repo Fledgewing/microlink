@@ -269,6 +269,7 @@ typedef struct {
     uint8_t *data;              /* Heap-allocated payload (caller frees on failure) */
     size_t len;                 /* Payload length */
     uint8_t frame_type;         /* DERP frame type (0x04 = SendPacket) */
+    uint16_t region;            /* relay region to send through (0 = home) */
 } ml_derp_tx_item_t;
 
 /* Received packet (from net_io to disco/wg queues) */
@@ -442,7 +443,21 @@ typedef struct {
 #endif
     bool connected;
     uint64_t last_recv_ms;          /* For keepalive watchdog */
+    uint16_t region;                /* relay region this connection is to */
+    uint64_t last_tx_ms;            /* extra connections: closed when idle */
+    uint64_t retry_after_ms;        /* extra connections: backoff after a failed open */
 } ml_derp_conn_t;
+
+/* Connections to other peers' home relay regions, besides our own. A peer
+ * is reached through its home region, as tailscaled does (magicsock
+ * derpWriteChanOfAddr); relay regions do not forward to each other. Each
+ * costs one TLS session of internal RAM while open; idle ones are closed. */
+#ifndef CONFIG_ML_DERP_EXTRA_CONNS
+#define CONFIG_ML_DERP_EXTRA_CONNS 1
+#endif
+#define ML_DERP_EXTRA_CONNS     CONFIG_ML_DERP_EXTRA_CONNS
+#define ML_DERP_EXTRA_IDLE_MS   60000   /* tailscaled: derpInactiveCleanupTime */
+#define ML_DERP_EXTRA_RETRY_MS  30000
 
 /* ============================================================================
  * Control Plane TLS State (CONFIG_ML_CTRL_TLS)
@@ -541,7 +556,8 @@ struct microlink_s {
 
     /* DERP connection (owned exclusively by DERP I/O task after connect) */
     /* Connection setup by coord task, then handed to DERP I/O task */
-    ml_derp_conn_t derp;
+    ml_derp_conn_t derp;                /* home region */
+    ml_derp_conn_t derp_extra[ML_DERP_EXTRA_CONNS > 0 ? ML_DERP_EXTRA_CONNS : 1];
 
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
@@ -601,6 +617,8 @@ struct microlink_s {
     ml_derp_region_t derp_regions[ML_MAX_DERP_REGIONS];
     uint8_t derp_region_count;
     uint16_t derp_home_region;      /* Our PreferredDERP region */
+    uint16_t derp_preferred_region; /* lowest-latency region measured (0 = not measured) */
+    uint16_t derp_forced_region;    /* set by the host: use this home region, skip the probe (0 = probe) */
 
     /* Key expiry (parsed from MapResponse self-node) */
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
@@ -705,7 +723,11 @@ void ml_net_io_task(void *arg);
 /* ml_derp.c */
 void ml_derp_tx_task(void *arg);
 esp_err_t ml_derp_connect(microlink_t *ml);
+/* ml_stun.c: probe every relay region over STUN and set derp_preferred_region
+ * (and derp_home_region) to the fastest. Blocks up to ~1.5 s. */
+void ml_derp_pick_region(microlink_t *ml);
 void ml_derp_disconnect(microlink_t *ml);
+void ml_derp_close_extras(microlink_t *ml);
 esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len);
 

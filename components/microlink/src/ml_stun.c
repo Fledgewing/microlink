@@ -595,3 +595,127 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
 
     return false;
 }
+
+/* ============================================================================
+ * Relay region latency (closest DERP region)
+ *
+ * Like tailscaled's netcheck: send a STUN binding request to one node of
+ * every relay region and take the region that answers first as our home
+ * (PreferredDERP). Two rounds, so one lost packet doesn't rule a region out.
+ * The current home region is kept unless another is clearly faster
+ * (netcheck keeps the old one unless the new one is 1/3 faster). With UDP
+ * blocked nothing answers and the preference stays as it was.
+ * Runs on the coord task with its own socket: replies never reach net_io.
+ * ========================================================================== */
+
+#define DERP_PROBE_ROUND_MS   500
+#define DERP_PROBE_TOTAL_MS   1500
+
+void ml_derp_pick_region(microlink_t *ml) {
+    if (ml->derp_forced_region) {
+        ml->derp_preferred_region = ml->derp_forced_region;
+        ml->derp_home_region = ml->derp_forced_region;
+        ESP_LOGI(TAG, "Home DERP region %d (set by host; not probing)", ml->derp_forced_region);
+        return;
+    }
+    const int n = ml->derp_region_count;
+    if (n <= 0) return;
+
+    /* static: ~1.8 KB, and only the coord task calls this */
+    static struct {
+        uint32_t ip;
+        uint16_t port;
+        uint8_t txid[2][12];
+        uint64_t sent_ms[2];
+        uint32_t rtt_ms;       /* 0 = no answer */
+    } probe[ML_MAX_DERP_REGIONS];
+    memset(probe, 0, sizeof(probe));
+
+    int usable = 0;
+    for (int i = 0; i < n; i++) {
+        const ml_derp_region_t *r = &ml->derp_regions[i];
+        if (r->avoid) continue;
+        for (int j = 0; j < r->node_count; j++) {
+            const ml_derp_node_t *node = &r->nodes[j];
+            unsigned a, b, c, d;
+            if (node->stun_port == 0xFFFF) continue;   /* STUNPort -1: no STUN */
+            if (sscanf(node->ipv4, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) continue;
+            probe[i].ip = (a << 24) | (b << 16) | (c << 8) | d;
+            probe[i].port = node->stun_port ? node->stun_port : 3478;
+            usable++;
+            break;
+        }
+    }
+    if (usable == 0) return;
+
+    int sock = ml_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock < 0) {
+        ESP_LOGW(TAG, "Region probe: no socket (errno %d)", errno);
+        return;
+    }
+
+    uint8_t req[STUN_REQUEST_SIZE];
+    const uint64_t t0 = ml_get_time_ms();
+    int round = 0;
+    for (;;) {
+        uint64_t now = ml_get_time_ms();
+        if (round < 2 && now >= t0 + (uint64_t)round * DERP_PROBE_ROUND_MS) {
+            for (int i = 0; i < n; i++) {
+                if (!probe[i].ip || probe[i].rtt_ms) continue;
+                size_t len = build_stun_request(req, probe[i].txid[round]);
+                struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(probe[i].port) };
+                to.sin_addr.s_addr = htonl(probe[i].ip);
+                probe[i].sent_ms[round] = ml_get_time_ms();
+                (void)ml_sendto(sock, req, len, 0, (struct sockaddr *)&to, sizeof(to));
+            }
+            round++;
+            continue;
+        }
+        if (now >= t0 + DERP_PROBE_TOTAL_MS || ml_shutdown_requested(ml)) break;
+
+        uint64_t until = (round < 2) ? t0 + (uint64_t)round * DERP_PROBE_ROUND_MS : t0 + DERP_PROBE_TOTAL_MS;
+        uint64_t wait = until > now ? until - now : 1;
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(sock, &rfds);
+        struct timeval tv = { .tv_sec = (long)(wait / 1000), .tv_usec = (long)((wait % 1000) * 1000) };
+        if (ml_select_fds(sock + 1, &rfds, NULL, NULL, &tv) <= 0) continue;
+
+        uint8_t buf[128];
+        struct sockaddr_in from;
+        socklen_t fl = sizeof(from);
+        int got = (int)ml_recvfrom(sock, buf, sizeof(buf), MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
+        uint64_t at = ml_get_time_ms();
+        if (got < STUN_HEADER_SIZE || buf[0] != 0x01 || buf[1] != 0x01) continue;
+        for (int i = 0; i < n; i++) {
+            if (probe[i].rtt_ms) continue;
+            for (int k = 0; k < 2; k++) {
+                if (probe[i].sent_ms[k] && memcmp(buf + 8, probe[i].txid[k], 12) == 0) {
+                    uint64_t rtt = at - probe[i].sent_ms[k];
+                    probe[i].rtt_ms = rtt ? (uint32_t)rtt : 1;
+                }
+            }
+        }
+    }
+    ml_close_sock(sock);
+
+    int best = -1, current = -1, answered = 0;
+    uint16_t home = ml->derp_preferred_region ? ml->derp_preferred_region : ml->derp_home_region;
+    for (int i = 0; i < n; i++) {
+        if (!probe[i].rtt_ms) continue;
+        answered++;
+        if (best < 0 || probe[i].rtt_ms < probe[best].rtt_ms) best = i;
+        if (ml->derp_regions[i].region_id == home) current = i;
+    }
+    if (best < 0) {
+        ESP_LOGW(TAG, "Region probe: no relay region answered over UDP; keeping region %d", home);
+        return;
+    }
+    int pick = best;
+    if (current >= 0 && probe[best].rtt_ms * 3 > probe[current].rtt_ms * 2) pick = current;
+    ESP_LOGI(TAG, "Region probe: %d/%d answered; fastest %s (%lu ms); home %s (%lu ms)", answered,
+             usable, ml->derp_regions[best].code, (unsigned long)probe[best].rtt_ms,
+             ml->derp_regions[pick].code, (unsigned long)probe[pick].rtt_ms);
+    ml->derp_preferred_region = ml->derp_regions[pick].region_id;
+    ml->derp_home_region = ml->derp_preferred_region;
+}
