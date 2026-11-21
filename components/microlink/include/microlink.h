@@ -260,6 +260,20 @@ bool microlink_control_busy(const microlink_t *ml);
 uint32_t microlink_control_sessions(void);
 
 /**
+ * @brief Register-only control sessions (ML_LITE_CONTROL_ONESHOT builds)
+ *
+ * For a login run on a device that cannot hold the tunnel and its screen at
+ * the same time. While on, a control session only sends the RegisterRequest
+ * (no Followup, no map, no relay) and then closes and its task exits:
+ *   - authorized:              state ML_STATE_CONNECTED
+ *   - not logged in (AuthURL): ML_STATE_NEEDS_LOGIN, microlink_get_auth_url()
+ *   - rejected / not approved: ML_STATE_AUTH_FAILED
+ * The state callback is called with the new state. I/O errors are retried
+ * as usual. Set it before microlink_start(). Off by default.
+ */
+void microlink_control_register_only(bool on);
+
+/**
  * @brief Your own lwIP IPv6 input hook, when MicroLink forwards IPv6
  *
  * With CONFIG_ML_ROUTER_IPV6, MicroLink implements lwIP's

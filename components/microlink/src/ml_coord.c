@@ -1010,6 +1010,9 @@ static int do_h2_preface(microlink_t *ml, ml_noise_state_t *noise) {
 #define ML_REG_AUTH_FAILED (-2)
 #define ML_REG_NEEDS_LOGIN (-3)   /* new AuthURL: the user has to log in */
 #define ML_REG_PENDING     (-4)   /* Followup came back before the login was done */
+/* do_register returned 0 after parsing a RegisterResponse (not a bodyless
+ * or unparsable one): what a register-only session reports as authorized. */
+static bool s_reg_confirmed;
 
 /* How long one Followup request waits for the user to finish logging in
  * before the connection is renewed and the Followup sent again. */
@@ -1127,6 +1130,7 @@ static void add_hostinfo(microlink_t *ml, cJSON *root) {
 
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
+    s_reg_confirmed = false;
 
     /* Build RegisterRequest JSON */
     cJSON *root = cJSON_CreateObject();
@@ -1483,6 +1487,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     }
 
     cJSON_Delete(resp_json);
+    s_reg_confirmed = true;
 
     int64_t t_reg_done = esp_timer_get_time();
     ESP_LOGI(TAG, "[TIMING] Register total: %ld ms", (long)((t_reg_done - t_reg_start) / 1000));
@@ -3322,6 +3327,7 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 #define ML_ONESHOT_REFRESH_TRIES  3
 
 static volatile uint32_t s_sessions_ok;   /* successful control sessions */
+static volatile bool s_register_only;    /* microlink_control_register_only() */
 
 #if ML_LITE_CONTROL_ONESHOT
 /* Orders "is a session requested?" against "the coord task has exited", so
@@ -3438,6 +3444,14 @@ bool microlink_control_busy(const microlink_t *ml) {
 }
 
 uint32_t microlink_control_sessions(void) { return s_sessions_ok; }
+
+void microlink_control_register_only(bool on) {
+#if ML_LITE_CONTROL_ONESHOT
+    s_register_only = on;
+#else
+    (void)on;
+#endif
+}
 
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 #if defined(CONFIG_ML_CTRL_TLS) || ML_COORD_TLS_FALLBACK
@@ -3641,6 +3655,26 @@ void ml_coord_task(void *arg) {
             {
                 uint64_t reg_start_ms = ml_get_time_ms();
                 int reg_rc = do_register(ml, &noise);
+#if ML_LITE_CONTROL_ONESHOT
+                /* No RegisterResponse body to go by: try again. */
+                if (s_register_only && reg_rc == 0 && !s_reg_confirmed) reg_rc = -1;
+                if (s_register_only && reg_rc != -1) {
+                    /* Register-only: report the outcome and hang up. */
+                    microlink_state_t st = reg_rc == 0 ? ML_STATE_CONNECTED
+                                         : reg_rc == ML_REG_AUTH_FAILED ? ML_STATE_AUTH_FAILED
+                                         : ML_STATE_NEEDS_LOGIN;
+                    ESP_LOGI(TAG, "Register-only session: %s; connection closed",
+                             st == ML_STATE_CONNECTED ? "authorized"
+                             : st == ML_STATE_NEEDS_LOGIN ? "login needed" : "not authorized");
+                    coord_close_conn(ml);
+                    ml->state = st;
+                    if (ml->state_cb) ml->state_cb(ml, st, ml->state_cb_data);
+                    state = COORD_IDLE;
+                    session_done = true;
+                    reconnect_attempts = 0;
+                    break;
+                }
+#endif
                 if (reg_rc == ML_REG_NEEDS_LOGIN || reg_rc == ML_REG_PENDING) {
                     /* Reconnect at once and send the Followup (register uses
                      * stream 1 of a fresh connection). */
