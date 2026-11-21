@@ -3384,14 +3384,16 @@ static void oneshot_end_task_unless_requested(microlink_t *ml, ml_noise_state_t 
     ml->coord_st.extra_data = NULL;
     ml->coord_st.extra_data_len = 0;
 
+    /* Log before the lock: printf takes a mutex, which asserts inside a
+     * critical section (seen on the X3). */
+    ESP_LOGI(TAG, "Control session closed; coord task exits (internal heap free %u, lowest %u)",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     taskENTER_CRITICAL(&s_session_mux);
     if (uxQueueMessagesWaiting(ml->coord_cmd_queue) > 0) {
         taskEXIT_CRITICAL(&s_session_mux);
         return;
     }
-    ESP_LOGI(TAG, "Control session closed; coord task exits (internal heap free %u, lowest %u)",
-             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
-             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
     /* As ml_task_exit(), but inside the lock: from the bit clear on, a new
      * request starts a new task. ml is not touched after it. */
     ml->coord_task = NULL;
