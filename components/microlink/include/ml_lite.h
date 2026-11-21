@@ -15,7 +15,9 @@
  *                        over ~8 KB.
  *   ML_LITE_NO_DIRECT    DERP only: no DISCO/WireGuard UDP socket, no STUN,
  *                        no direct-path DISCO pings or CallMeMaybe, no
- *                        net_io task.
+ *                        net_io task. 2 = chosen per start: DERP only unless
+ *                        microlink_set_direct_path(ml, true) before
+ *                        microlink_start() (the direct-path code is built in).
  *   ML_LITE_SMALL_FILTER Packet filter tables sized for a client that only
  *                        takes replies to its own connections.
  */
@@ -39,6 +41,14 @@
 #endif
 #ifndef ML_LITE_NO_DIRECT
 #define ML_LITE_NO_DIRECT ML_LITE_DEFAULT
+#endif
+/* ML_DIRECT_OFF(ml): true when this run has no direct path (no UDP socket). */
+#if ML_LITE_NO_DIRECT == 1
+#define ML_DIRECT_OFF(ml) 1
+#elif ML_LITE_NO_DIRECT == 2
+#define ML_DIRECT_OFF(ml) (!(ml)->direct_path)
+#else
+#define ML_DIRECT_OFF(ml) 0
 #endif
 #ifndef ML_LITE_SMALL_FILTER
 #define ML_LITE_SMALL_FILTER ML_LITE_DEFAULT
@@ -94,4 +104,13 @@
  * one per peer is enough. 0 = the upstream 24. */
 #ifndef ML_LITE_NACL_CACHE_SLOTS
 #define ML_LITE_NACL_CACHE_SLOTS 0
+#endif
+
+/* ML_DERP_RATE_LOG: every 10 s while relayed traffic flows, one INFO line
+ * with the relay's frames and bytes each way, packets dropped on a full
+ * queue, and the tunnel task's busy time (DERP TLS read + WireGuard work).
+ * Measurement only; the counters cost a few bytes and two timer reads per
+ * frame. */
+#ifndef ML_DERP_RATE_LOG
+#define ML_DERP_RATE_LOG 0
 #endif

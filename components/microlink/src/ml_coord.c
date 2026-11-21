@@ -1961,7 +1961,7 @@ static int add_endpoints_to_json(microlink_t *ml, cJSON *root) {
     /* LAN endpoint (WiFi station or Ethernet) */
     {
         uint32_t local_ip;
-        if (ml_lan_ipv4(&local_ip)) {
+        if (ml_lan_ipv4(ml, &local_ip)) {
             char ep_str[32];
             snprintf(ep_str, sizeof(ep_str), "%lu.%lu.%lu.%lu:%u",
                      (unsigned long)((local_ip >> 24) & 0xFF),
@@ -3745,6 +3745,10 @@ void microlink_cached_start_peer(microlink_t *ml, uint32_t vpn_ip, bool auto_fal
 }
 
 bool microlink_control_cached(const microlink_t *ml) { return ml && ml->cached_run; }
+
+void microlink_set_direct_path(microlink_t *ml, bool allowed) {
+    if (ml) ml->direct_path = allowed;
+}
 
 /* Hours of key validity left, or -1 when unknown (no clock). */
 static __attribute__((unused)) long ctl_key_hours_left(int64_t expiry) {

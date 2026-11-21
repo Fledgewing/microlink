@@ -192,4 +192,8 @@ void wireguardif_set_udp_output_pbuf(struct netif *netif, wireguard_udp_output_p
 // When enabled, peer_output always uses DERP even if peer has a direct endpoint.
 void wireguardif_force_derp_output(struct netif *netif, bool force);
 
+// Initiation -> response time of the last handshake this device started (ms):
+// the tunnel's round trip on the path it went over (DERP or direct).
+uint32_t wireguardif_last_handshake_rtt_ms(void);
+
 #endif /* _WIREGUARDIF_H_ */

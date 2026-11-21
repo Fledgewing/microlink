@@ -719,11 +719,17 @@ esp_err_t microlink_start(microlink_t *ml) {
 
 bsd_socket_fallback:
 #endif
-#if ML_LITE_NO_DIRECT
+#if ML_LITE_NO_DIRECT != 1
+    if (ML_DIRECT_OFF(ml))
+#endif
+    {
     /* DERP only: no DISCO/WireGuard UDP socket (and so no STUN and no direct
      * path). WireGuard traffic and DISCO from peers arrive over DERP. */
     ESP_LOGI(TAG, "DERP-only mode: no direct UDP path");
-#else
+    }
+#if ML_LITE_NO_DIRECT != 1
+    else {
+    ESP_LOGI(TAG, "Direct path allowed: UDP socket, STUN and DISCO pings; DERP until one forms");
     /* Create DISCO/magicsock UDP socket (port 51820 = WireGuard standard)
      * This is the single socket for ALL direct UDP traffic: DISCO pings/pongs,
      * CallMeMaybe probes, and WireGuard encrypted data.
@@ -760,7 +766,8 @@ bsd_socket_fallback:
     } else {
         ESP_LOGE(TAG, "Failed to create DISCO socket: errno=%d", errno);
     }
-#endif /* ML_LITE_NO_DIRECT */
+    }
+#endif /* ML_LITE_NO_DIRECT != 1 */
 #ifdef CONFIG_ML_ZERO_COPY_WG
 skip_bsd_socket:
     ;
@@ -779,7 +786,7 @@ skip_bsd_socket:
         BaseType_t core;
         uint32_t bit;
     } tasks[] = {
-#if !ML_LITE_NO_DIRECT
+#if ML_LITE_NO_DIRECT != 1
         /* net_io only serves the UDP sockets (DISCO, STUN) */
         { ml_net_io_task,  "ml_net_io",  ML_TASK_NET_IO_STACK,  ML_TASK_NET_IO_PRIO,  ML_TASK_NET_IO_CORE,  ML_TASK_BIT_NET_IO },
 #endif
@@ -796,7 +803,7 @@ skip_bsd_socket:
 #endif
     };
     TaskHandle_t *handles[] = {
-#if !ML_LITE_NO_DIRECT
+#if ML_LITE_NO_DIRECT != 1
         &ml->net_io_task,
 #endif
         &ml->derp_tx_task,      /* ML_LITE_TASKS: the tunnel task, which also
@@ -812,6 +819,14 @@ skip_bsd_socket:
     for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
         if (cached && tasks[i].bit == ML_TASK_BIT_COORD) {
             *handles[i] = NULL;   /* microlink_control_refresh() starts one if needed */
+            continue;
+        }
+        if (tasks[i].bit == ML_TASK_BIT_NET_IO && ml->disco_sock4 < 0
+#ifdef CONFIG_ML_ZERO_COPY_WG
+            && !ml->zc.pcb
+#endif
+            && ML_DIRECT_OFF(ml)) {
+            *handles[i] = NULL;   /* no UDP socket this run (ML_LITE_NO_DIRECT 2) */
             continue;
         }
         __atomic_fetch_or(&ml->tasks_alive, tasks[i].bit, __ATOMIC_RELEASE);
@@ -907,7 +922,8 @@ esp_err_t microlink_rebind(microlink_t *ml) {
     }
     ESP_LOGW(TAG, "Rebind: zero-copy init failed, using BSD socket fallback");
 #endif
-#if !ML_LITE_NO_DIRECT
+#if ML_LITE_NO_DIRECT != 1
+    if (!ML_DIRECT_OFF(ml)) {
     ml->disco_sock4 = ml_socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (ml->disco_sock4 >= 0) {
         struct sockaddr_in bind_addr = {
@@ -932,7 +948,8 @@ esp_err_t microlink_rebind(microlink_t *ml) {
     } else {
         ESP_LOGE(TAG, "Rebind: failed to create DISCO socket: errno=%d", errno);
     }
-#endif /* !ML_LITE_NO_DIRECT */
+    }
+#endif /* ML_LITE_NO_DIRECT != 1 */
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 rebind_wg_update:
@@ -1072,13 +1089,13 @@ static bool lan_netif_up(esp_netif_t *netif, void *arg) {
            esp_netif_get_ip_info(netif, &info) == ESP_OK && info.ip.addr != 0;
 }
 
-bool ml_lan_ipv4(uint32_t *ip_out) {
-#if ML_LITE_NO_DIRECT
-    /* No UDP socket to reach us on: advertise no Local endpoint, so peers
-     * never try a direct path. */
-    (void)ip_out;
-    return false;
-#endif
+bool ml_lan_ipv4(const microlink_t *ml, uint32_t *ip_out) {
+    if (ML_DIRECT_OFF(ml)) {
+        /* No UDP socket to reach us on: advertise no Local endpoint, so peers
+         * never try a direct path. */
+        (void)ml; (void)ip_out;
+        return false;
+    }
     esp_netif_t *netif = esp_netif_get_default_netif();
     if (!netif || !lan_netif_up(netif, NULL)) netif = esp_netif_find_if(lan_netif_up, NULL);
     esp_netif_ip_info_t info;

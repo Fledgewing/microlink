@@ -66,7 +66,14 @@
 
 #define REKEY_AFTER_MESSAGES		(1ULL << 60)
 #define REJECT_AFTER_MESSAGES		(0xFFFFFFFFFFFFFFFFULL - (1ULL << 13))
+// ML_WG_REKEY_AFTER_S: a shorter rekey time for tests (e.g. 20 s to see a
+// rekey within a short download); 0 or unset = the protocol's 120 s. Must stay
+// below REJECT_AFTER_TIME (180 s).
+#if defined(ML_WG_REKEY_AFTER_S) && (ML_WG_REKEY_AFTER_S > 0) && (ML_WG_REKEY_AFTER_S < 170)
+#define REKEY_AFTER_TIME			(ML_WG_REKEY_AFTER_S)
+#else
 #define REKEY_AFTER_TIME			(120)
+#endif
 #define REJECT_AFTER_TIME			(180)
 #define REKEY_TIMEOUT				(5)
 #define KEEPALIVE_TIMEOUT			(10)

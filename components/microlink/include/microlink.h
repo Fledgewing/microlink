@@ -291,6 +291,14 @@ void microlink_cached_start_peer(microlink_t *ml, uint32_t vpn_ip, bool auto_fal
  */
 bool microlink_control_cache_usable(microlink_t *ml);
 
+/**
+ * With ML_LITE_NO_DIRECT 2: may this run use the direct UDP path (UDP socket,
+ * net_io task, STUN, DISCO pings and CallMeMaybe)? Off by default (DERP
+ * only). Set before microlink_start(). Where no direct path forms, traffic
+ * stays on DERP. No effect with ML_LITE_NO_DIRECT 0 or 1.
+ */
+void microlink_set_direct_path(microlink_t *ml, bool allowed);
+
 /** True while this run is on cached control state (no session has run yet). */
 bool microlink_control_cached(const microlink_t *ml);
 

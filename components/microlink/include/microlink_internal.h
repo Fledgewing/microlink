@@ -138,7 +138,12 @@ extern "C" {
 #else
 #define ML_DERP_TX_QUEUE_DEPTH  16
 #endif
-#if ML_LITE_NO_DIRECT
+#if ML_LITE_NO_DIRECT == 2
+/* Direct path chosen per start: one server peer on the LAN or behind one
+ * NAT; a lost STUN reply or DISCO pong is retried by the next round. */
+#define ML_DISCO_RX_QUEUE_DEPTH 4
+#define ML_STUN_RX_QUEUE_DEPTH  2
+#elif ML_LITE_NO_DIRECT
 /* DISCO only arrives over DERP (pings from peers); no STUN replies at all,
  * but coord still reads the queue, so it exists. */
 #if ML_LITE_SMALL_QUEUES && ML_LITE_TASKS
@@ -656,6 +661,10 @@ struct microlink_s {
     ml_derp_conn_t derp_extra[ML_DERP_EXTRA_CONNS > 0 ? ML_DERP_EXTRA_CONNS : 1];
 #endif
 
+    /* ML_LITE_NO_DIRECT 2: this run may use the direct path
+     * (microlink_set_direct_path, before microlink_start) */
+    bool direct_path;
+
     /* Sockets for net_io select() loop */
     int disco_sock4;                    /* UDP socket for DISCO + direct WG */
     int disco_sock6;                    /* IPv6 UDP socket (-1 if unavailable) */
@@ -827,7 +836,7 @@ void ml_ota_confirm(void);         /* on CONNECTED: keep the new firmware */
  * Ethernet, never cellular PPP) that peers on the same network can reach
  * directly: the default interface if it is one, else the first that is up.
  * Advertised as the "Local" endpoint. False if there is none. */
-bool ml_lan_ipv4(uint32_t *ip_out);
+bool ml_lan_ipv4(const microlink_t *ml, uint32_t *ip_out);
 
 /* ml_net_io.c */
 void ml_net_io_task(void *arg);
@@ -837,6 +846,18 @@ void ml_derp_tx_task(void *arg);
 
 /* The DERP I/O task's loop, in steps, so ML_LITE_TASKS can run it in the
  * same task as the WireGuard manager (ml_tunnel_task). DERP task only. */
+/* ML_DERP_RATE_LOG counters (ml_derp.c), written by the task that owns the
+ * DERP connection and the WireGuard RX queue (one task with ML_LITE_TASKS;
+ * otherwise read racily, which only blurs a log line). */
+typedef struct {
+    uint32_t rx_bytes, tx_bytes;
+    uint32_t rx_drops;          /* wg_rx full or no pbuf: the sender retransmits */
+    uint32_t tx_drops;          /* derp_tx full: oldest or new packet dropped */
+    uint32_t read_us;           /* in poll_derp_read for a frame (TLS read + decrypt) */
+    uint32_t wg_us;             /* in process_wg_packet (WireGuard decrypt + lwIP input) */
+} ml_derp_rate_t;
+extern ml_derp_rate_t ml_derp_rate;
+
 typedef struct {
     uint32_t frames_rx;
     uint32_t frames_tx;
@@ -845,6 +866,8 @@ typedef struct {
     uint64_t last_heartbeat_ms;
     uint64_t connected_since_ms;
     bool verbose_phase;         /* verbose logging for first 15s after connect */
+    uint32_t rate_frames_rx;    /* ML_DERP_RATE_LOG: frames_rx at the last line */
+    uint32_t rate_frames_tx;
 } ml_derp_io_t;
 
 typedef enum {

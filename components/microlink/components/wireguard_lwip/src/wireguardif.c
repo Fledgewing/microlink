@@ -532,6 +532,11 @@ static void wireguardif_send_keepalive(struct wireguard_device *device, struct w
 	wireguardif_output_to_peer(device->netif, NULL, NULL, peer);
 }
 
+// Initiation -> response time of the last handshake we started (a log value,
+// written by the one task that processes responses).
+static uint32_t s_last_handshake_rtt_ms;
+uint32_t wireguardif_last_handshake_rtt_ms(void) { return s_last_handshake_rtt_ms; }
+
 static void wireguardif_process_response_message(struct wireguard_device *device, struct message_handshake_response *response, const ip_addr_t *addr, u16_t port) {
 	WG_DEBUG("[WG] Processing handshake response from %s:%u",
 		ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
@@ -554,17 +559,27 @@ static void wireguardif_process_response_message(struct wireguard_device *device
 	update_peer_addr(peer, addr, port);
 	// Session is up - reset the give-up counter for the next time we need it.
 	peer->handshake_attempts = 0;
+	// Initiation sent -> response here: the tunnel round trip (plus the
+	// peer's X25519 work, a few ms), logged below as the path's RTT.
+	uint32_t hs_rtt_ms = wireguard_sys_now() - peer->last_initiation_tx;
 	wireguard_start_session(peer, true);
+	// The new keypair is fresh: drop a rekey request raised while this
+	// handshake was in flight. Every packet sent on the expiring initiator
+	// keypair in the meantime sets send_handshake again (output path,
+	// REKEY_AFTER_TIME), and left set it started a second, needless handshake
+	// once REKEY_TIMEOUT had passed (seen on the X3: +5.5 s after each rekey).
+	peer->send_handshake = false;
 	wg_state_unlock();
 	wg_hs_unlock();
+	s_last_handshake_rtt_ms = hs_rtt_ms;
 
 	// Packet is good — identify the peer
 	uint8_t wg_idx = wireguard_peer_index(device, peer);
-	ESP_LOGI(WG_TAG, "Handshake complete (initiator): wg_idx=%u key=%02x%02x%02x%02x via %s:%u",
+	ESP_LOGI(WG_TAG, "Handshake complete (initiator): wg_idx=%u key=%02x%02x%02x%02x via %s:%u, rtt %lu ms",
 	       wg_idx,
 	       peer->public_key[0], peer->public_key[1],
 	       peer->public_key[2], peer->public_key[3],
-	       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port);
+	       ip_addr_isany(addr) ? "DERP" : ipaddr_ntoa(addr), port, (unsigned long)hs_rtt_ms);
 	wireguardif_send_keepalive(device, peer);
 
 	// Set the IF-UP flag on netif

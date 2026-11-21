@@ -18,6 +18,7 @@
 #include "ml_config_httpd.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_timer.h"
 #include "esp_netif.h"
 #include "lwip/sockets.h"
 #include "lwip/netif.h"
@@ -1486,11 +1487,8 @@ static void disco_build_pong(microlink_t *ml, int peer_idx,
  * attacker re-send a captured PONG from its own address and become the
  * peer's "direct path". */
 static void disco_ping_round(microlink_t *ml, int peer_idx, bool force) {
-#if ML_LITE_NO_DIRECT
     /* DERP only: no UDP socket to ping from or to learn a path on */
-    (void)ml; (void)peer_idx; (void)force;
-    return;
-#endif
+    if (ML_DIRECT_OFF(ml)) return;
     ml_peer_t *p = &ml->peers[peer_idx];
     uint64_t now = ml_get_time_ms();
 
@@ -2182,11 +2180,8 @@ deliver:;
  * ========================================================================== */
 
 static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
-#if ML_LITE_NO_DIRECT
     /* DERP only: we have no endpoint for the peer to call */
-    (void)ml; (void)peer_idx;
-    return;
-#endif
+    if (ML_DIRECT_OFF(ml)) return;
     ml_peer_t *p = &ml->peers[peer_idx];
 
     /* Build plaintext: [type(1)][version(1)][endpoints(N * 18)] */
@@ -2200,7 +2195,7 @@ static void disco_send_call_me_maybe(microlink_t *ml, int peer_idx) {
     /* 1. Local LAN IP endpoint (critical for same-network peers) */
     {
         uint32_t local_ip;
-        if (ml_lan_ipv4(&local_ip)) {
+        if (ml_lan_ipv4(ml, &local_ip)) {
             uint16_t local_port = ml->disco_local_port;
 
             if (local_port > 0) {
@@ -2629,10 +2624,16 @@ static __attribute__((noinline)) void wg_mgr_step_data(microlink_t *ml, wg_mgr_l
     bool wg_rx = false;
     if (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
         wg_rx = true;
+#if ML_DERP_RATE_LOG
+        int64_t wg_t0 = esp_timer_get_time();
+#endif
         process_wg_packet(ml, &wg_pkt);
         while (xQueueReceive(ml->wg_rx_queue, &wg_pkt, 0) == pdTRUE) {
             process_wg_packet(ml, &wg_pkt);
         }
+#if ML_DERP_RATE_LOG
+        ml_derp_rate.wg_us += (uint32_t)(esp_timer_get_time() - wg_t0);
+#endif
     }
 
     /* Run WireGuard periodic processing (handshakes, keepalives, rekeys).

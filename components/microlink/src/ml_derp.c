@@ -49,6 +49,8 @@
 #endif /* ML_LITE_DERP_WOLFSSL */
 #include "nacl_box.h"
 #include "lwip/pbuf.h"
+
+ml_derp_rate_t ml_derp_rate;
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -827,6 +829,7 @@ void ml_rx_packet_release(ml_rx_packet_t *pkt) {
 static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
                                const uint8_t *src_pubkey) {
     pkt_type_t type = classify_packet(data, len);
+    ml_derp_rate.rx_bytes += len;
 
     ml_rx_packet_t pkt = {
         .data = data,
@@ -837,6 +840,7 @@ static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
 
     QueueHandle_t target = (type == PKT_DISCO) ? ml->disco_rx_queue : ml->wg_rx_queue;
     if (xQueueSend(target, &pkt, 0) != pdTRUE) {
+        ml_derp_rate.rx_drops++;
         free(data);
     } else {
         ml_wg_mgr_wake(ml);
@@ -975,6 +979,7 @@ static int poll_derp_read(microlink_t *ml, ml_derp_conn_t *c) {
         struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)plen, PBUF_RAM);
         if (!p) {
             /* Keep the stream aligned; the sender retransmits. */
+            ml_derp_rate.rx_drops++;
             return derp_skip_payload(c, plen) < 0 ? -1 : 1;
         }
         if (derp_tls_read_all(c, p->payload, plen, 5000) < 0) {
@@ -984,9 +989,11 @@ static int poll_derp_read(microlink_t *ml, ml_derp_conn_t *c) {
         }
         uint8_t *data = p->payload;
         if (classify_packet(data, plen) == PKT_WIREGUARD) {
+            ml_derp_rate.rx_bytes += plen;
             ml_rx_packet_t pkt = { .data = data, .len = plen, .via_derp = true, .pbuf = p };
             memcpy(pkt.src_pubkey, src_key, 32);
             if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
+                ml_derp_rate.rx_drops++;
                 pbuf_free(p);
             } else {
                 ml_wg_mgr_wake(ml);
@@ -1252,6 +1259,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
         ml_derp_tx_item_t dropped;
         if (xQueueReceive(ml->derp_tx_queue, &dropped, 0) == pdTRUE) {
             free(dropped.data);  /* Drop oldest */
+            ml_derp_rate.tx_drops++;
         }
         if (xQueueSend(ml->derp_tx_queue, &item, 0) == pdTRUE) {
             derp_wake(ml);
@@ -1260,6 +1268,7 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
     }
 
     /* Still full after 3 attempts, drop new packet */
+    ml_derp_rate.tx_drops++;
     free(pkt_data);
     return ESP_ERR_TIMEOUT;
 }
@@ -1295,6 +1304,25 @@ ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
                      (unsigned long)io->frames_rx, (unsigned long)io->frames_tx,
                      (unsigned long)io->loop_count);
             io->last_status_ms = now_ms;
+#if ML_DERP_RATE_LOG
+            /* Only while relayed traffic flows (more than keepalives). */
+            uint32_t frx = io->frames_rx - io->rate_frames_rx;
+            uint32_t ftx = io->frames_tx - io->rate_frames_tx;
+            if (frx + ftx > 20) {
+                ml_derp_rate_t r = ml_derp_rate;
+                memset(&ml_derp_rate, 0, sizeof(ml_derp_rate));
+                ESP_LOGI(TAG, "DERP rate 10 s: rx %lu frames %lu KB, tx %lu frames %lu KB, "
+                         "drops rx %lu tx %lu, busy: DERP read %lu ms, WireGuard %lu ms",
+                         (unsigned long)frx, (unsigned long)(r.rx_bytes / 1024),
+                         (unsigned long)ftx, (unsigned long)(r.tx_bytes / 1024),
+                         (unsigned long)r.rx_drops, (unsigned long)r.tx_drops,
+                         (unsigned long)(r.read_us / 1000), (unsigned long)(r.wg_us / 1000));
+            } else {
+                memset(&ml_derp_rate, 0, sizeof(ml_derp_rate));
+            }
+            io->rate_frames_rx = io->frames_rx;
+            io->rate_frames_tx = io->frames_tx;
+#endif
         }
     }
 
@@ -1402,6 +1430,7 @@ ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
                 xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
             } else {
                 io->frames_tx++;
+                ml_derp_rate.tx_bytes += item.len;
             }
             free(item.data);
         }
@@ -1413,8 +1442,14 @@ ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
     {
         int burst;
         for (burst = 0; burst < 4; burst++) {
+#if ML_DERP_RATE_LOG
+            int64_t read_t0 = esp_timer_get_time();
+#endif
             int ret = poll_derp_read(ml, &ml->derp);
             if (ret > 0) {
+#if ML_DERP_RATE_LOG
+                ml_derp_rate.read_us += (uint32_t)(esp_timer_get_time() - read_t0);
+#endif
                 io->frames_rx++;
                 ml->derp.last_recv_ms = ml_get_time_ms();
             } else if (ret == 0) {

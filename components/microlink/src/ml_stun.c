@@ -146,12 +146,11 @@ static esp_err_t ensure_stun_socket(microlink_t *ml) {
  * ========================================================================== */
 
 esp_err_t ml_stun_resolve_servers(microlink_t *ml) {
-#if ML_LITE_NO_DIRECT
-    /* DERP only: no endpoint discovery. With no server address the coord
-     * task's probes and retries below all become no-ops. */
-    (void)ml;
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
+    if (ML_DIRECT_OFF(ml)) {
+        /* DERP only: no endpoint discovery. With no server address the coord
+         * task's probes and retries below all become no-ops. */
+        return ESP_ERR_NOT_SUPPORTED;
+    }
     struct addrinfo *res = NULL;
 
     /* Determine primary STUN host — use parsed DERPMap home region if available */
@@ -252,10 +251,7 @@ esp_err_t ml_stun_resolve_servers(microlink_t *ml) {
  * ========================================================================== */
 
 esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port) {
-#if ML_LITE_NO_DIRECT
-    (void)ml; (void)server; (void)port;
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
+    if (ML_DIRECT_OFF(ml)) return ESP_ERR_NOT_SUPPORTED;
     /* Resolve STUN server — accept either IPv4 or IPv6 */
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM };
     struct addrinfo *res = NULL;
@@ -320,10 +316,7 @@ esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port)
  * ========================================================================== */
 
 esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t port) {
-#if ML_LITE_NO_DIRECT
-    (void)ml; (void)server_ip; (void)port;
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
+    if (ML_DIRECT_OFF(ml)) return ESP_ERR_NOT_SUPPORTED;
     if (server_ip == 0) return ESP_ERR_INVALID_ARG;
 
     /* Use disco_sock4 for STUN probes so the NAT mapping (external IP:port)
@@ -507,10 +500,7 @@ static esp_err_t ensure_stun_socket6(microlink_t *ml) {
 }
 
 esp_err_t ml_stun_send_probe_ipv6(microlink_t *ml, const uint8_t *server_ip6, uint16_t port) {
-#if ML_LITE_NO_DIRECT
-    (void)ml; (void)server_ip6; (void)port;
-    return ESP_ERR_NOT_SUPPORTED;
-#endif
+    if (ML_DIRECT_OFF(ml)) return ESP_ERR_NOT_SUPPORTED;
     /* Check for zero address */
     static const uint8_t zero16[16] = {0};
     if (memcmp(server_ip6, zero16, 16) == 0) return ESP_ERR_INVALID_ARG;
