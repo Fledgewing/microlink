@@ -48,6 +48,7 @@
 #endif
 #endif /* ML_LITE_DERP_WOLFSSL */
 #include "nacl_box.h"
+#include "lwip/pbuf.h"
 #include <string.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -811,6 +812,16 @@ static pkt_type_t classify_packet(const uint8_t *data, size_t len) {
     return PKT_UNKNOWN;
 }
 
+void ml_rx_packet_release(ml_rx_packet_t *pkt) {
+    if (pkt->pbuf) {
+        pbuf_free((struct pbuf *)pkt->pbuf);
+    } else {
+        free(pkt->data);
+    }
+    pkt->pbuf = NULL;
+    pkt->data = NULL;
+}
+
 static void route_derp_packet(microlink_t *ml, uint8_t *data, size_t len,
                                const uint8_t *src_pubkey) {
     pkt_type_t type = classify_packet(data, len);
@@ -884,6 +895,20 @@ static void dispatch_derp_frame(microlink_t *ml, ml_derp_conn_t *c, uint8_t fram
  * indefinitely (timeout surfaces as WANT_READ from the blocking-recv BIO).
  * Returns: 1 = frame read and dispatched, 0 = timeout (no data), <0 = error
  */
+#if ML_LITE_DERP_FRAME_CAP > 0 || ML_LITE_RX_ONEBUF
+/* Read and discard len payload bytes in small pieces (keeps the frame
+ * stream aligned without allocating). 0 or -1. */
+static int derp_skip_payload(ml_derp_conn_t *c, size_t len) {
+    uint8_t sink[64];
+    while (len > 0) {
+        size_t n = len < sizeof(sink) ? len : sizeof(sink);
+        if (derp_tls_read_all(c, sink, n, 5000) < 0) return -1;
+        len -= n;
+    }
+    return 0;
+}
+#endif
+
 static int poll_derp_read(microlink_t *ml, ml_derp_conn_t *c) {
     if (!c->connected || c->sockfd < 0) return -1;
 
@@ -925,6 +950,55 @@ static int poll_derp_read(microlink_t *ml, ml_derp_conn_t *c) {
         ESP_LOGW(TAG, "DERP frame too large: %lu", (unsigned long)len);
         return -1;
     }
+
+#if ML_LITE_DERP_FRAME_CAP > 0
+    /* Nothing a client is sent over DERP comes near this (see ml_lite.h):
+     * read the frame through and drop it, without allocating it. */
+    if (len > ML_LITE_DERP_FRAME_CAP) {
+        ESP_LOGW(TAG, "DERP frame type 0x%02x of %lu bytes over the %d cap: dropped",
+                 frame_type, (unsigned long)len, ML_LITE_DERP_FRAME_CAP);
+        return derp_skip_payload(c, len) < 0 ? -1 : 1;
+    }
+#endif
+
+#if ML_LITE_RX_ONEBUF
+    /* A relayed packet: the sender's key onto the stack, the packet straight
+     * into the pbuf WireGuard decrypts in place (one copy of it, not four). */
+    if (frame_type == DERP_FRAME_RECV_PACKET && len > 32) {
+        if (derp_tls_read_all(c, src_key, 32, 5000) < 0) {
+            ESP_LOGW(TAG, "DERP payload read error (key)");
+            return -1;
+        }
+        size_t plen = len - 32;
+        struct pbuf *p = pbuf_alloc(PBUF_RAW, (u16_t)plen, PBUF_RAM);
+        if (!p) {
+            /* Keep the stream aligned; the sender retransmits. */
+            return derp_skip_payload(c, plen) < 0 ? -1 : 1;
+        }
+        if (derp_tls_read_all(c, p->payload, plen, 5000) < 0) {
+            ESP_LOGW(TAG, "DERP payload read error at %lu bytes", (unsigned long)plen);
+            pbuf_free(p);
+            return -1;
+        }
+        uint8_t *data = p->payload;
+        if (classify_packet(data, plen) == PKT_WIREGUARD) {
+            ml_rx_packet_t pkt = { .data = data, .len = plen, .via_derp = true, .pbuf = p };
+            memcpy(pkt.src_pubkey, src_key, 32);
+            if (xQueueSend(ml->wg_rx_queue, &pkt, 0) != pdTRUE) {
+                pbuf_free(p);
+            } else {
+                ml_wg_mgr_wake(ml);
+            }
+            return 1;
+        }
+        /* DISCO (and anything else): the heap copy its readers free */
+        uint8_t *copy = malloc(plen);
+        if (copy) memcpy(copy, data, plen);
+        pbuf_free(p);
+        if (copy) route_derp_packet(ml, copy, plen, src_key);
+        return 1;
+    }
+#endif
 
     /* Read frame payload - we already got the header so payload should follow.
      * Use longer timeout (2s) since we KNOW data is coming. */
@@ -1131,15 +1205,32 @@ esp_err_t ml_derp_queue_send(microlink_t *ml, const uint8_t *dest_key,
                               const uint8_t *data, size_t len) {
     if (!ml || !dest_key || !data || len == 0) return ESP_ERR_INVALID_ARG;
 
+#if ML_LITE_RX_ONEBUF
+    /* The whole SendPacket frame, built once: [type | length | key | payload] */
+    uint8_t *pkt_data = malloc(5 + 32 + len);
+    if (!pkt_data) return ESP_ERR_NO_MEM;
+    uint32_t flen = (uint32_t)(32 + len);
+    pkt_data[0] = DERP_FRAME_SEND_PACKET;
+    pkt_data[1] = (flen >> 24) & 0xFF;
+    pkt_data[2] = (flen >> 16) & 0xFF;
+    pkt_data[3] = (flen >> 8) & 0xFF;
+    pkt_data[4] = flen & 0xFF;
+    memcpy(pkt_data + 5, dest_key, 32);
+    memcpy(pkt_data + 5 + 32, data, len);
+    const bool framed = true;
+#else
     uint8_t *pkt_data = malloc(len);
     if (!pkt_data) return ESP_ERR_NO_MEM;
     memcpy(pkt_data, data, len);
+    const bool framed = false;
+#endif
 
     ml_derp_tx_item_t item = {
         .data = pkt_data,
         .len = len,
         .frame_type = DERP_FRAME_SEND_PACKET,
         .region = derp_region_of_peer(ml, dest_key),
+        .framed = framed,
     };
     memcpy(item.dest_pubkey, dest_key, 32);
 
@@ -1236,6 +1327,9 @@ ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
                 }
                 ESP_LOGW(TAG, "DERP connect attempt %d failed", attempt + 1);
             }
+            /* A run waiting for its home relay (cached start, or a session
+             * that left the connect to us) learns the outcome. */
+            if (!ml_shutdown_requested(ml)) ml_ctl_derp_result(ml, ml->derp.connected);
         }
         if (bits & ML_EVT_DERP_RECONNECT) {
             xEventGroupClearBits(ml->events, ML_EVT_DERP_RECONNECT);
@@ -1258,6 +1352,7 @@ ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
                 }
                 ESP_LOGW(TAG, "DERP reconnect attempt %d failed", attempt + 1);
             }
+            if (!ml_shutdown_requested(ml)) ml_ctl_derp_result(ml, ml->derp.connected);
         }
     }
 
@@ -1285,11 +1380,14 @@ ml_derp_step_t ml_derp_io_step(microlink_t *ml, ml_derp_io_t *io) {
             ml_derp_conn_t *c = &ml->derp;
             if (item.frame_type == DERP_FRAME_SEND_PACKET) {
                 c = derp_conn_for_region(ml, item.region);
-                ESP_LOGD(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, hdr=%02x, region=%d",
+                ESP_LOGD(TAG, "DERP TX: SendPacket %d bytes, dest=%02x%02x%02x%02x, region=%d",
                          (int)item.len, item.dest_pubkey[0], item.dest_pubkey[1],
-                         item.dest_pubkey[2], item.dest_pubkey[3],
-                         item.data[0], c->region);
-                ret = derp_send_packet(c, item.dest_pubkey, item.data, item.len);
+                         item.dest_pubkey[2], item.dest_pubkey[3], c->region);
+                if (item.framed) {
+                    ret = derp_tls_write_all(c, item.data, 5 + 32 + item.len) < 0 ? -1 : 0;
+                } else {
+                    ret = derp_send_packet(c, item.dest_pubkey, item.data, item.len);
+                }
             } else {
                 ret = derp_write_frame(c, item.frame_type, item.data, item.len);
             }
@@ -1463,7 +1561,11 @@ esp_err_t ml_derp_connect(microlink_t *ml) {
         }
     }
 
-    esp_err_t err = derp_conn_open(ml, &ml->derp, derp_host, derp_port, derp_region_used, true);
+    /* The region table can be swapped by a control session while the
+     * connect runs (seconds): connect with a copy of the name. */
+    char host[sizeof(((ml_derp_node_t *)0)->hostname)];
+    strlcpy(host, derp_host, sizeof(host));
+    esp_err_t err = derp_conn_open(ml, &ml->derp, host, derp_port, derp_region_used, true);
     if (err == ESP_OK) {
         xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECTED);
     }

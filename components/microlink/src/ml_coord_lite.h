@@ -42,6 +42,48 @@
 #define ML_LITE_STREAM_MAP ML_LITE_DEFAULT
 #endif
 
+/*   ML_LITE_REG_ONEBUF       The RegisterResponse is read into one buffer
+ *                            (4 KB, grown only for a larger frame), each
+ *                            Noise frame decrypted in place, the H2 DATA
+ *                            compacted in place. Was 16 + 8 + 4 KB plus a
+ *                            ciphertext copy per frame. On for every build:
+ *                            same bytes parsed, same limits. */
+#ifndef ML_LITE_REG_ONEBUF
+#define ML_LITE_REG_ONEBUF 1
+#endif
+
+/*   ML_LITE_DERP_AFTER_CONTROL  One-shot sessions: report endpoints (with the
+ *                            home region already picked), close, end the
+ *                            coord task, and only then connect the home
+ *                            relay. The session no longer holds its stack
+ *                            and buffers while the relay's TLS handshake
+ *                            runs. CONNECTED is reported once DERP is up.
+ *                            Needs ML_LITE_CONTROL_ONESHOT. */
+#ifndef ML_LITE_DERP_AFTER_CONTROL
+#define ML_LITE_DERP_AFTER_CONTROL ML_LITE_DEFAULT
+#endif
+
+/*   ML_LITE_CACHED_START     Skip the control session at start when the
+ *                            state the last full session left is still good
+ *                            (ml_ctl_cache.c): our node key (not within
+ *                            ML_CACHED_KEY_MARGIN_S of expiry), VPN IP, the
+ *                            home relay node we reported as PreferredDERP,
+ *                            and the peer the host needs (in the peer
+ *                            cache). Falls back to a control session when
+ *                            any is missing, DERP does not connect, or the
+ *                            host asks for one (microlink_control_refresh).
+ *                            Needs ML_LITE_CONTROL_ONESHOT. */
+#ifndef ML_LITE_CACHED_START
+#define ML_LITE_CACHED_START ML_LITE_DEFAULT
+#endif
+
+#if !ML_LITE_CONTROL_ONESHOT
+#undef ML_LITE_DERP_AFTER_CONTROL
+#define ML_LITE_DERP_AFTER_CONTROL 0
+#undef ML_LITE_CACHED_START
+#define ML_LITE_CACHED_START 0
+#endif
+
 /* Port 80 with a TLS fallback on 443 (TLS state on the heap, in use only
  * while connected over 443). */
 #if ML_LITE_CONTROL_PLAIN && !defined(CONFIG_ML_CTRL_TLS)

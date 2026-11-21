@@ -36,6 +36,8 @@
 #include "lwip/netdb.h"
 #include "lwip/ip6_addr.h"
 #include "mbedtls/base64.h"
+#include "nvs.h"
+#include <time.h>
 #include <string.h>
 #include <errno.h>
 
@@ -1128,6 +1130,116 @@ static void add_hostinfo(microlink_t *ml, cJSON *root) {
     cJSON_AddItemToObject(root, "Hostinfo", hostinfo);
 }
 
+#if ML_LITE_REG_ONEBUF
+/* Room for at least `need` bytes in *buf (grown with realloc). */
+static bool reg_buf_reserve(uint8_t **buf, size_t *cap, size_t need) {
+    if (need <= *cap) return true;
+    size_t ncap = *cap;
+    while (ncap < need) ncap *= 2;
+    /* Stay in PSRAM where there is some (realloc could move it inside). */
+    uint8_t *nb = heap_caps_realloc(*buf, ncap, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!nb) nb = realloc(*buf, ncap);
+    if (!nb) {
+        ESP_LOGE(TAG, "RegisterResponse: no memory to grow to %u bytes", (unsigned)ncap);
+        return false;
+    }
+    *buf = nb;
+    *cap = ncap;
+    return true;
+}
+
+/* True once the H2 frames in b[0..len) hold END_STREAM on stream 1. */
+static bool reg_h2_has_end(const uint8_t *b, size_t len) {
+    size_t scan = 0;
+    while (scan + 9 <= len) {
+        uint32_t fl = ((uint32_t)b[scan] << 16) | ((uint32_t)b[scan + 1] << 8) | b[scan + 2];
+        uint8_t ft = b[scan + 3];
+        uint8_t ff = b[scan + 4];
+        uint32_t fs = ((uint32_t)(b[scan + 5] & 0x7F) << 24) | ((uint32_t)b[scan + 6] << 16) |
+                      ((uint32_t)b[scan + 7] << 8) | b[scan + 8];
+        if (fl > 1000000 || scan + 9 + fl > len) return false;
+        if (fs == 1 && (ft == 0x00 || ft == 0x01) && (ff & 0x01)) return true;
+        scan += 9 + fl;
+    }
+    return false;
+}
+
+#define REG_RESP_FIRST_BUF  4096
+#define REG_RESP_H2_LIMIT   16384   /* as the 16 KB buffer it replaces */
+#define REG_RESP_DATA_LIMIT 8192
+
+/* ML_LITE_REG_ONEBUF: read the RegisterResponse (up to 10 Noise frames, until
+ * END_STREAM on stream 1) into one buffer. Each frame is read at the end of
+ * what is there and decrypted in place (the MAC is checked before anything
+ * is decrypted; ChaCha20 then XORs in place). The stream-1 DATA payloads are
+ * then moved down over the H2 frame headers, so *out holds the body at its
+ * start with room for a terminating NUL. Same limits as the three-buffer
+ * version: H2 bytes past 16 KB and DATA past 8 KB are dropped.
+ * Returns 0 (*out may be NULL when nothing came) or -1. */
+static int reg_read_response(microlink_t *ml, ml_noise_state_t *noise,
+                             uint8_t **out, size_t *out_len) {
+    size_t cap = REG_RESP_FIRST_BUF;
+    uint8_t *buf = ml_psram_malloc(cap);
+    if (!buf) return -1;
+    size_t have = 0;
+    size_t peak = cap;
+
+    for (int frame_count = 0; frame_count < 10; frame_count++) {
+        int ct_len = noise_recv_header(ml);
+        if (ct_len < 0) break;
+        size_t pt_len = (size_t)ct_len - 16;
+        /* Read into the tail; +1 keeps room for the NUL the parser adds. */
+        if (!reg_buf_reserve(&buf, &cap, have + (size_t)ct_len + 1)) {
+            free(buf);
+            return -1;
+        }
+        if (cap > peak) peak = cap;
+        uint8_t *at = buf + have;
+        if (coord_recv_ex(ml, at, (size_t)ct_len, true) < 0) {
+            ESP_LOGE(TAG, "RegisterResponse frame read failed: ct_len=%d errno=%d", ct_len, errno);
+            break;
+        }
+        if (ml_noise_decrypt(noise->rx_key, noise->rx_nonce, NULL, 0, at, (size_t)ct_len, at) != ESP_OK) {
+            ESP_LOGE(TAG, "Noise decrypt failed (nonce=%lu)", (unsigned long)noise->rx_nonce);
+            break;
+        }
+        noise->rx_nonce++;
+        ESP_LOGI(TAG, "RegisterResponse Noise frame %d: %d bytes", frame_count, (int)pt_len);
+        if (have + pt_len < REG_RESP_H2_LIMIT) have += pt_len;   /* else dropped, as before */
+        if (reg_h2_has_end(buf, have)) break;
+    }
+
+    /* Compact stream-1 DATA payloads to the front (write <= read always). */
+    size_t total = 0;
+    size_t fpos = 0;
+    while (fpos + 9 <= have) {
+        uint32_t f_len = ((uint32_t)buf[fpos] << 16) | ((uint32_t)buf[fpos + 1] << 8) | buf[fpos + 2];
+        uint8_t f_type = buf[fpos + 3];
+        uint32_t f_stream = ((uint32_t)(buf[fpos + 5] & 0x7F) << 24) | ((uint32_t)buf[fpos + 6] << 16) |
+                            ((uint32_t)buf[fpos + 7] << 8) | buf[fpos + 8];
+        fpos += 9;
+        if (f_len > 1000000 || fpos + f_len > have) {
+            ESP_LOGW(TAG, "  Invalid H2 frame length %lu at pos %d, stopping",
+                     (unsigned long)f_len, (int)fpos - 9);
+            break;
+        }
+        if (f_stream == 1 && f_type == 0x00 && f_len > 0 && total + f_len < REG_RESP_DATA_LIMIT) {
+            memmove(buf + total, buf + fpos, f_len);
+            total += f_len;
+        }
+        fpos += f_len;
+    }
+    ESP_LOGI(TAG, "RegisterResponse buffer: %u bytes (%u of H2)", (unsigned)peak, (unsigned)have);
+    if (total == 0) {
+        free(buf);
+        buf = NULL;
+    }
+    *out = buf;
+    *out_len = total;
+    return 0;
+}
+#endif /* ML_LITE_REG_ONEBUF */
+
 static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_reg_start = esp_timer_get_time();
     s_reg_confirmed = false;
@@ -1227,6 +1339,11 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
 
     if (followup) coord_set_rcv_timeout(ml, ML_LOGIN_FOLLOWUP_WAIT_MS);
 
+#if ML_LITE_REG_ONEBUF
+    uint8_t *resp_buf = NULL;
+    size_t resp_total = 0;
+    if (reg_read_response(ml, noise, &resp_buf, &resp_total) < 0) return -1;
+#else
     /* Read RegisterResponse - accumulate all Noise frames into H2 buffer first,
      * then parse H2 frames (same pattern as MapResponse). */
     uint8_t *h2_resp = ml_psram_malloc(16384);
@@ -1314,6 +1431,7 @@ static int do_register(microlink_t *ml, ml_noise_state_t *noise) {
     (void)got_end_stream;  /* Currently unused for completion detection (suppress -Wunused-but-set-variable) */
     free(h2_resp);
 
+#endif
     /* Send connection-level WINDOW_UPDATE for RegisterResponse.
      * Stream 1 is closed (END_STREAM received), only update connection level. */
     if (resp_total > 0) {
@@ -2000,13 +2118,29 @@ static void parse_self_node_from_map(microlink_t *ml, cJSON *map_json) {
     }
 }
 
-#if ML_LITE_CONTEXT && ML_LITE_DERP_TRIM
-/* ML_LITE_DERP_TRIM: once a session is over and DERP is connected, the
- * region table (ML_MAX_DERP_REGIONS entries, ~6 KB) shrinks to the regions in
- * use: our home region and our peers' home regions. The next session's
- * DERPMap gets the full table back first (derp_table_full()). */
-static int s_derp_cap = ML_MAX_DERP_REGIONS;
+#if ML_LITE_CONTEXT
+/* Lite context: the region table is its own allocation of
+ * ml->derp_region_cap entries (microlink_init() allocates all
+ * ML_MAX_DERP_REGIONS, or none with ML_LITE_DERP_LAZY). A DERPMap first gets
+ * the full table (derp_table_full()); ML_LITE_DERP_TRIM shrinks it to the
+ * regions in use after the session, a cached start (ML_LITE_CACHED_START)
+ * holds only the home region. */
 
+/* Replace the table with `fresh` (cap entries, count of them in use).
+ * Readers index ml->derp_regions below ml->derp_region_count: shrink the
+ * count first, then swap; the old table goes after the tunnel task has
+ * passed its loop at least once (no wait while no task runs). */
+static void derp_table_swap(microlink_t *ml, ml_derp_region_t *fresh, int cap, int count, bool tasks_running) {
+    ml_derp_region_t *old = ml->derp_regions;
+    if (count < ml->derp_region_count) ml->derp_region_count = count;
+    __atomic_store_n(&ml->derp_regions, fresh, __ATOMIC_RELEASE);
+    ml->derp_region_cap = (uint8_t)cap;
+    ml->derp_region_count = count;
+    if (old && tasks_running) vTaskDelay(pdMS_TO_TICKS(200));
+    free(old);
+}
+
+#if ML_LITE_DERP_TRIM
 static bool derp_region_wanted(const microlink_t *ml, uint16_t id) {
     if (id == ml->derp_home_region) return true;
     for (int i = 0; i < ml->peer_count; i++) {
@@ -2015,12 +2149,17 @@ static bool derp_region_wanted(const microlink_t *ml, uint16_t id) {
     return false;
 }
 
+/* ML_LITE_DERP_TRIM: once a session is over and DERP is connected (or about
+ * to connect, ML_LITE_DERP_AFTER_CONTROL: the home region is picked), keep
+ * only our home region and our peers' home regions (~6 KB back). */
 static void derp_table_trim(microlink_t *ml) {
-    if (s_derp_cap < ML_MAX_DERP_REGIONS) return;
+    if (ml->derp_region_cap < ML_MAX_DERP_REGIONS) return;
+#if !ML_LITE_DERP_AFTER_CONTROL
     if (!ml->derp.connected) {
         ESP_LOGI(TAG, "DERP region table kept: DERP not connected yet");
         return;
     }
+#endif
     int keep = 0;
     for (int i = 0; i < ml->derp_region_count; i++) {
         if (derp_region_wanted(ml, ml->derp_regions[i].region_id)) keep++;
@@ -2032,36 +2171,29 @@ static void derp_table_trim(microlink_t *ml) {
     for (int i = 0; i < ml->derp_region_count && n < keep; i++) {
         if (derp_region_wanted(ml, ml->derp_regions[i].region_id)) small[n++] = ml->derp_regions[i];
     }
-    ml_derp_region_t *old = ml->derp_regions;
-    /* Readers index ml->derp_regions below ml->derp_region_count: shrink the
-     * count first, then swap; the old table goes after the tunnel task has
-     * passed its loop at least once. */
-    ml->derp_region_count = n;
-    __atomic_store_n(&ml->derp_regions, small, __ATOMIC_RELEASE);
-    s_derp_cap = n;
-    vTaskDelay(pdMS_TO_TICKS(200));
-    free(old);
+    derp_table_swap(ml, small, n, n, true);
     ESP_LOGI(TAG, "DERP region table trimmed to %d regions: %u bytes back", n,
              (unsigned)((ML_MAX_DERP_REGIONS - n) * sizeof(ml_derp_region_t)));
 }
+#endif /* ML_LITE_DERP_TRIM */
 
-/* Before a DERPMap is parsed: the full table again. */
+/* Before a DERPMap is parsed: the full table (again, or for the first time
+ * with ML_LITE_DERP_LAZY). */
 static void derp_table_full(microlink_t *ml) {
-    if (s_derp_cap >= ML_MAX_DERP_REGIONS) return;
+    if (ml->derp_region_cap >= ML_MAX_DERP_REGIONS) return;
     ml_derp_region_t *full = calloc(ML_MAX_DERP_REGIONS, sizeof(ml_derp_region_t));
     if (!full) {
-        ESP_LOGW(TAG, "DERP region table: no memory to grow back; keeping %d regions", s_derp_cap);
+        ESP_LOGW(TAG, "DERP region table: no memory to grow; keeping %d regions", ml->derp_region_cap);
         return;
     }
-    ml_derp_region_t *old = ml->derp_regions;
-    memcpy(full, old, (size_t)ml->derp_region_count * sizeof(ml_derp_region_t));
-    __atomic_store_n(&ml->derp_regions, full, __ATOMIC_RELEASE);
-    s_derp_cap = ML_MAX_DERP_REGIONS;
-    vTaskDelay(pdMS_TO_TICKS(200));
-    free(old);
-    ESP_LOGI(TAG, "DERP region table back to %d entries", ML_MAX_DERP_REGIONS);
+    if (ml->derp_regions && ml->derp_region_count) {
+        memcpy(full, ml->derp_regions, (size_t)ml->derp_region_count * sizeof(ml_derp_region_t));
+    }
+    derp_table_swap(ml, full, ML_MAX_DERP_REGIONS, ml->derp_region_count, true);
+    ESP_LOGI(TAG, "DERP region table: %d entries (%u bytes)", ML_MAX_DERP_REGIONS,
+             (unsigned)(ML_MAX_DERP_REGIONS * sizeof(ml_derp_region_t)));
 }
-#define DERP_TABLE_CAP s_derp_cap
+#define DERP_TABLE_CAP ml->derp_region_cap
 #else
 #define DERP_TABLE_CAP ML_MAX_DERP_REGIONS
 #endif
@@ -2148,7 +2280,7 @@ static void parse_derp_map_from_map(microlink_t *ml, cJSON *map_json) {
     cJSON *regions = cJSON_GetObjectItem(derp_map, "Regions");
     if (!regions) return;
 
-#if ML_LITE_CONTEXT && ML_LITE_DERP_TRIM
+#if ML_LITE_CONTEXT
     derp_table_full(ml);
 #endif
     ml->derp_region_count = 0;
@@ -3400,6 +3532,11 @@ static int do_send_endpoint_update(microlink_t *ml, ml_noise_state_t *noise) {
 
 static volatile uint32_t s_sessions_ok;   /* successful control sessions */
 static volatile bool s_register_only;    /* microlink_control_register_only() */
+#if ML_LITE_DERP_AFTER_CONTROL
+/* ML_EVT_DERP_CONNECT_REQ or _RECONNECT to raise once the session is closed
+ * (0 = none). Coord task only. */
+static EventBits_t s_derp_after;
+#endif
 
 #if ML_LITE_CONTROL_ONESHOT
 /* Orders "is a session requested?" against "the coord task has exited", so
@@ -3433,16 +3570,18 @@ static void oneshot_take_stun(microlink_t *ml) {
 /* Report our endpoints and home relay (Stream=false, OmitPeers=true) and
  * wait for the server to answer it, so closing the connection right after
  * cannot cancel the request. */
-static void oneshot_report_endpoints(microlink_t *ml, ml_noise_state_t *noise) {
+static bool oneshot_report_endpoints(microlink_t *ml, ml_noise_state_t *noise) {
     oneshot_take_stun(ml);
     if (do_send_endpoint_update_ex(ml, noise, true) < 0) {
         ESP_LOGW(TAG, "Endpoint update failed; the server keeps the previous one");
-        return;
+        return false;
     }
     h2r_t r = { .want_stream = ml->h2_next_stream_id - 2 };
     if (h2r_read_until_end(ml, noise, &r, 5000) < 0) {
         ESP_LOGW(TAG, "No answer to the endpoint update (stream %lu)", (unsigned long)r.want_stream);
+        return false;
     }
+    return true;
 }
 
 /* Close the session's connection and free its state. If no other session
@@ -3457,6 +3596,16 @@ static void oneshot_end_task_unless_requested(microlink_t *ml, ml_noise_state_t 
     ml->coord_st.extra_data_len = 0;
 #if ML_LITE_CONTEXT && ML_LITE_DERP_TRIM
     derp_table_trim(ml);
+#endif
+#if ML_LITE_DERP_AFTER_CONTROL
+    /* The session's connection and buffers are gone: connect the relay now
+     * (after the trim, so the DERP task never reads a table being swapped). */
+    if (s_derp_after) {
+        ESP_LOGI(TAG, "Relay %s after the control session (region %d)",
+                 s_derp_after == ML_EVT_DERP_RECONNECT ? "moves" : "connects", ml->derp_home_region);
+        xEventGroupSetBits(ml->events, s_derp_after);
+        s_derp_after = 0;
+    }
 #endif
 
     /* Log before the lock: printf takes a mutex, which asserts inside a
@@ -3530,6 +3679,252 @@ void microlink_control_register_only(bool on) {
 #endif
 }
 
+/* ============================================================================
+ * Cached control state (ML_LITE_CACHED_START)
+ *
+ * A successful one-shot session leaves what a later start needs to run
+ * without one: our node key and its expiry, our VPN IP, and the home relay
+ * node we reported as PreferredDERP (the region the control plane tells our
+ * peers to reach us through). The peers themselves are in the peer cache
+ * (ml_peer_nvs.c). A start that finds all of it still good connects the
+ * cached relay and installs the cached peers without a control session; the
+ * session's ~70 KB peak and the fragmentation it leaves never happen.
+ * ========================================================================== */
+
+#define CTL_CACHE_NS    "microlink"    /* the keys' namespace: a factory reset erases it */
+#define CTL_CACHE_KEY   "ctl_cache"
+#define CTL_CACHE_VER   1
+/* Node keys this close to expiry get a control session (which re-registers
+ * the key in time); the reader's clock can also be behind after a cold boot. */
+#ifndef ML_CACHED_KEY_MARGIN_S
+#define ML_CACHED_KEY_MARGIN_S  (2 * 24 * 3600)
+#endif
+#define CTL_CLOCK_SANE  1700000000LL   /* before 2023-11: the clock is not set */
+
+typedef struct __attribute__((packed)) {
+    uint8_t version;
+    uint8_t node_key[32];       /* the WireGuard public key this state is for */
+    int64_t key_expiry;         /* Unix seconds, 0 = does not expire */
+    uint32_t vpn_ip;
+    uint8_t vpn_ip6[16];
+    uint8_t has_ip6;
+    uint16_t region;            /* the PreferredDERP we reported */
+    char code[8];
+    char host[64];              /* its first DERP node */
+    char ipv4[16];
+    uint16_t port;
+} ctl_cache_t;
+
+static void ctl_cache_erase(const char *reason) {
+#if ML_LITE_CACHED_START
+    nvs_handle_t h;
+    if (nvs_open(CTL_CACHE_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    if (nvs_erase_key(h, CTL_CACHE_KEY) == ESP_OK) {
+        nvs_commit(h);
+        ESP_LOGW(TAG, "Cached control state dropped: %s", reason);
+    }
+    nvs_close(h);
+#else
+    (void)reason;
+#endif
+}
+
+void microlink_control_cache_invalidate(const char *reason) {
+    ctl_cache_erase(reason ? reason : "host request");
+}
+
+void microlink_cached_start_peer(microlink_t *ml, uint32_t vpn_ip, bool auto_fallback) {
+    if (!ml) return;
+    ml->cached_start_peer = vpn_ip;
+    ml->cached_auto_fallback = auto_fallback;
+}
+
+bool microlink_control_cached(const microlink_t *ml) { return ml && ml->cached_run; }
+
+/* Hours of key validity left, or -1 when unknown (no clock). */
+static __attribute__((unused)) long ctl_key_hours_left(int64_t expiry) {
+    int64_t now = (int64_t)time(NULL);
+    if (now < CTL_CLOCK_SANE) return -1;
+    return (long)((expiry - now) / 3600);
+}
+
+#if ML_LITE_CACHED_START
+/* After a successful full session: remember what a cached start needs. */
+static void ctl_cache_save(microlink_t *ml) {
+    if (ml->key_expired) {
+        ctl_cache_erase("node key expired");
+        return;
+    }
+    uint16_t region = ml->derp_preferred_region ? ml->derp_preferred_region : ML_DERP_REGION;
+    const ml_derp_region_t *r = NULL;
+    for (int i = 0; i < ml->derp_region_count; i++) {
+        if (ml->derp_regions[i].region_id == region) { r = &ml->derp_regions[i]; break; }
+    }
+    const ml_derp_node_t *node = NULL;
+    for (int j = 0; r && j < r->node_count; j++) {
+        if (!r->nodes[j].stun_only && r->nodes[j].hostname[0]) { node = &r->nodes[j]; break; }
+    }
+    if (!ml->vpn_ip || !node) {
+        ESP_LOGW(TAG, "Control state not cached: %s", !ml->vpn_ip ? "no VPN IP" : "home relay not in the DERPMap");
+        ctl_cache_erase("incomplete");
+        return;
+    }
+    ctl_cache_t c;
+    memset(&c, 0, sizeof(c));
+    c.version = CTL_CACHE_VER;
+    memcpy(c.node_key, ml->wg_public_key, 32);
+    c.key_expiry = ml->key_expiry_epoch;
+    c.vpn_ip = ml->vpn_ip;
+    memcpy(c.vpn_ip6, ml->vpn_ip6, 16);
+    c.has_ip6 = ml->has_vpn_ip6;
+    c.region = region;
+    memcpy(c.code, r->code, sizeof(c.code));
+    memcpy(c.host, node->hostname, sizeof(c.host));
+    memcpy(c.ipv4, node->ipv4, sizeof(c.ipv4));
+    c.port = node->derp_port;
+
+    nvs_handle_t h;
+    if (nvs_open(CTL_CACHE_NS, NVS_READWRITE, &h) != ESP_OK) return;
+    ctl_cache_t old;
+    size_t len = sizeof(old);
+    bool same = nvs_get_blob(h, CTL_CACHE_KEY, &old, &len) == ESP_OK && len == sizeof(old) &&
+                memcmp(&old, &c, sizeof(c)) == 0;
+    if (!same) {   /* flash wear: write only what changed */
+        if (nvs_set_blob(h, CTL_CACHE_KEY, &c, sizeof(c)) == ESP_OK) nvs_commit(h);
+    }
+    nvs_close(h);
+    ESP_LOGI(TAG, "Control state cached%s: relay region %u (%s), key expires in %ld h",
+             same ? " (unchanged)" : "", (unsigned)region, c.host,
+             c.key_expiry ? ctl_key_hours_left(c.key_expiry) : -1L);
+}
+
+bool ml_ctl_cache_try_start(microlink_t *ml) {
+    char why[64] = "";
+    ctl_cache_t c;
+    long hours = -1;
+    if (s_register_only) return false;   /* the login boot registers */
+    if (!ml->cached_start_peer) {
+        snprintf(why, sizeof(why), "no server peer known yet");
+    } else {
+        nvs_handle_t h;
+        size_t len = sizeof(c);
+        esp_err_t err = nvs_open(CTL_CACHE_NS, NVS_READONLY, &h);
+        if (err == ESP_OK) {
+            err = nvs_get_blob(h, CTL_CACHE_KEY, &c, &len);
+            nvs_close(h);
+        }
+        if (err != ESP_OK) {
+            snprintf(why, sizeof(why), "no cached state");
+        } else if (len != sizeof(c) || c.version != CTL_CACHE_VER) {
+            snprintf(why, sizeof(why), "cached state from another version");
+        } else if (memcmp(c.node_key, ml->wg_public_key, 32) != 0) {
+            snprintf(why, sizeof(why), "node key changed");
+        } else if (!c.vpn_ip || !c.host[0] || !c.region) {
+            snprintf(why, sizeof(why), "cached state incomplete");
+        } else if (ml->derp_forced_region && ml->derp_forced_region != c.region) {
+            snprintf(why, sizeof(why), "relay region %u -> %u", (unsigned)c.region,
+                     (unsigned)ml->derp_forced_region);
+        } else if (!ml_peer_nvs_has(ml->cached_start_peer)) {
+            snprintf(why, sizeof(why), "server peer not in the peer cache");
+        } else if (c.key_expiry) {
+            hours = ctl_key_hours_left(c.key_expiry);
+            if (hours < 0 && (int64_t)time(NULL) < CTL_CLOCK_SANE) {
+                snprintf(why, sizeof(why), "clock not set (key expiry unknown)");
+            } else if (c.key_expiry - (int64_t)time(NULL) < ML_CACHED_KEY_MARGIN_S) {
+                snprintf(why, sizeof(why), "node key expires in %ld h", hours);
+            }
+        }
+    }
+    if (why[0]) {
+        ESP_LOGI(TAG, "Control session needed: %s", why);
+        return false;
+    }
+
+    ml_derp_region_t reg;
+    memset(&reg, 0, sizeof(reg));
+    reg.region_id = c.region;
+    memcpy(reg.code, c.code, sizeof(reg.code));
+    reg.code[sizeof(reg.code) - 1] = 0;
+    memcpy(reg.nodes[0].hostname, c.host, sizeof(reg.nodes[0].hostname));
+    reg.nodes[0].hostname[sizeof(reg.nodes[0].hostname) - 1] = 0;
+    memcpy(reg.nodes[0].ipv4, c.ipv4, sizeof(reg.nodes[0].ipv4));
+    reg.nodes[0].ipv4[sizeof(reg.nodes[0].ipv4) - 1] = 0;
+    reg.nodes[0].derp_port = c.port;
+    reg.node_count = 1;
+#if ML_LITE_CONTEXT
+    ml_derp_region_t *one = malloc(sizeof(*one));
+    if (!one) {
+        ESP_LOGW(TAG, "Control session needed: no memory for the relay entry");
+        return false;
+    }
+    *one = reg;
+    derp_table_swap(ml, one, 1, 1, false);   /* no task runs yet */
+#else
+    ml->derp_regions[0] = reg;
+    ml->derp_region_count = 1;
+#endif
+    ml->vpn_ip = c.vpn_ip;
+    memcpy(ml->vpn_ip6, c.vpn_ip6, 16);
+    ml->has_vpn_ip6 = c.has_ip6 != 0;
+    ml->key_expiry_epoch = c.key_expiry;
+    ml->key_expired = false;
+    ml->derp_preferred_region = c.region;
+    ml->derp_home_region = c.region;
+    ml->cached_run = true;
+    ml->connected_on_derp = true;
+    if (c.key_expiry) {
+        ESP_LOGI(TAG, "Control skipped: cached state valid (key expires in %ld h); relay region %u (%s)",
+                 hours, (unsigned)c.region, c.host);
+    } else {
+        ESP_LOGI(TAG, "Control skipped: cached state valid (key does not expire); relay region %u (%s)",
+                 (unsigned)c.region, c.host);
+    }
+    return true;
+}
+#else
+bool ml_ctl_cache_try_start(microlink_t *ml) {
+    (void)ml;
+    return false;
+}
+#endif /* ML_LITE_CACHED_START */
+
+static void ctl_report_connected(microlink_t *ml) {
+    if (ml->state != ML_STATE_CONNECTED) {
+        ml->state = ML_STATE_CONNECTED;
+        if (ml->state_cb) ml->state_cb(ml, ML_STATE_CONNECTED, ml->state_cb_data);
+    }
+}
+
+void ml_ctl_derp_result(microlink_t *ml, bool connected) {
+    if (!ml->connected_on_derp) return;
+    ml->connected_on_derp = false;
+    ESP_LOGI(TAG, "Home relay %s%s (internal heap free %u, largest %u, lowest %u)",
+             connected ? "up" : "unreachable", ml->cached_run ? " on cached state" : " after the session",
+             (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL),
+             (unsigned)heap_caps_get_minimum_free_size(MALLOC_CAP_INTERNAL));
+    if (connected || !ml->cached_run) {
+        /* After a session the relay failing is left to the host's tunnel
+         * wait, as when the session waited for it. */
+        ctl_report_connected(ml);
+        return;
+    }
+    ctl_cache_erase("cached relay unreachable");
+    if (ml->cached_auto_fallback) {
+        ESP_LOGW(TAG, "Control fallback: cached relay region %u unreachable; running a control session",
+                 (unsigned)ml->derp_home_region);
+        if (microlink_control_refresh(ml) != ESP_OK) {
+            ml->state = ML_STATE_ERROR;
+            if (ml->state_cb) ml->state_cb(ml, ML_STATE_ERROR, ml->state_cb_data);
+        }
+    } else {
+        ESP_LOGW(TAG, "Control fallback needed: cached relay region %u unreachable; left to the host",
+                 (unsigned)ml->derp_home_region);
+        ml->state = ML_STATE_ERROR;
+        if (ml->state_cb) ml->state_cb(ml, ML_STATE_ERROR, ml->state_cb_data);
+    }
+}
+
 static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 #if defined(CONFIG_ML_CTRL_TLS) || ML_COORD_TLS_FALLBACK
     /* Decrypted bytes may already sit in the TLS layer with nothing left
@@ -3581,6 +3976,9 @@ static int poll_map_update(microlink_t *ml, ml_noise_state_t *noise) {
 void ml_coord_task(void *arg) {
     microlink_t *ml = (microlink_t *)arg;
     ESP_LOGI(TAG, "Coord task started (Core %d)", xPortGetCoreID());
+#if ML_LITE_DERP_AFTER_CONTROL
+    s_derp_after = 0;
+#endif
 
     coord_state_t state = COORD_IDLE;
     ml_coord_cmd_t cmd;
@@ -3744,6 +4142,7 @@ void ml_coord_task(void *arg) {
                              st == ML_STATE_CONNECTED ? "authorized"
                              : st == ML_STATE_NEEDS_LOGIN ? "login needed" : "not authorized");
                     coord_close_conn(ml);
+                    if (st != ML_STATE_CONNECTED) ctl_cache_erase("not logged in");
                     ml->state = st;
                     if (ml->state_cb) ml->state_cb(ml, st, ml->state_cb_data);
                     state = COORD_IDLE;
@@ -3756,6 +4155,7 @@ void ml_coord_task(void *arg) {
                     /* Reconnect at once and send the Followup (register uses
                      * stream 1 of a fresh connection). */
                     if (reg_rc == ML_REG_NEEDS_LOGIN) {
+                        ctl_cache_erase("login required");
                         ESP_LOGW(TAG, "Login required: open the URL from "
                                       "microlink_get_auth_url() to add this device");
                         ESP_LOGD(TAG, "Login URL: %s", ml->auth_url);
@@ -3782,6 +4182,7 @@ void ml_coord_task(void *arg) {
                 if (reg_rc < 0) {
                     ESP_LOGE(TAG, "Registration failed");
                     if (reg_rc == ML_REG_AUTH_FAILED) {
+                        ctl_cache_erase("registration rejected");
                         /* Not transient: retrying with the same key will keep
                          * failing. Notify the host (its "re-login" prompt) and
                          * jump to maximum backoff — the loop keeps running in
@@ -3858,10 +4259,19 @@ void ml_coord_task(void *arg) {
                 ml_derp_pick_region(ml);
                 if (ml->derp.connected && had && ml->derp_home_region != had) {
                     ESP_LOGI(TAG, "Home DERP region %d -> %d", had, ml->derp_home_region);
+#if ML_LITE_DERP_AFTER_CONTROL
+                    s_derp_after = ML_EVT_DERP_RECONNECT;   /* once the session is closed */
+#else
                     xEventGroupSetBits(ml->events, ML_EVT_DERP_RECONNECT);
+#endif
                 }
             }
 
+#if ML_LITE_DERP_AFTER_CONTROL
+            /* The relay connects once the session is closed and its memory
+             * is back (oneshot_end_task_unless_requested()). */
+            if (!ml->derp.connected && !s_derp_after) s_derp_after = ML_EVT_DERP_CONNECT_REQ;
+#else
             /* Signal DERP I/O task to connect (connection now owned by I/O task) */
             if (!ml->derp.connected) {
                 xEventGroupSetBits(ml->events, ML_EVT_DERP_CONNECT_REQ);
@@ -3871,14 +4281,22 @@ void ml_coord_task(void *arg) {
                                     ML_EVT_DERP_CONNECTED | ML_EVT_SHUTDOWN_REQUEST,
                                     pdFALSE, pdFALSE, pdMS_TO_TICKS(15000));
             }
+#endif
 
 #if ML_LITE_CONTROL_ONESHOT
             /* Control then close: report where we are, then hang up. The
              * map, peers and relay connection stay; the coord task ends at
              * COORD_IDLE and its stack and buffers are freed. */
-            oneshot_report_endpoints(ml, &noise);
+            bool reported = oneshot_report_endpoints(ml, &noise);
             coord_close_conn(ml);
             s_sessions_ok++;
+            ml->cached_run = false;
+#if ML_LITE_CACHED_START
+            if (reported) ctl_cache_save(ml);
+            else ctl_cache_erase("endpoint report failed");
+#else
+            (void)reported;
+#endif
             state = COORD_IDLE;
             session_done = true;
             reconnect_attempts = 0;
@@ -3886,10 +4304,13 @@ void ml_coord_task(void *arg) {
             ESP_LOGI(TAG, "Control session %lu done (%s); connection closed",
                      (unsigned long)s_sessions_ok, refresh ? "refresh" : "first");
             refresh = true;   /* any further session in this task is a refresh */
-            if (ml->state != ML_STATE_CONNECTED) {
-                ml->state = ML_STATE_CONNECTED;
-                if (ml->state_cb) ml->state_cb(ml, ML_STATE_CONNECTED, ml->state_cb_data);
+#if ML_LITE_DERP_AFTER_CONTROL
+            if (s_derp_after && ml->state != ML_STATE_CONNECTED) {
+                ml->connected_on_derp = true;   /* ml_ctl_derp_result() reports it */
+                break;
             }
+#endif
+            ctl_report_connected(ml);
             break;
 #endif
 

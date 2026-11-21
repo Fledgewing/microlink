@@ -57,3 +57,41 @@
 #ifndef ML_LITE_MAX_PEERS
 #define ML_LITE_MAX_PEERS 2
 #endif
+
+/* ML_LITE_DERP_LAZY: no DERP region table at microlink_init(); the first
+ * DERPMap allocates it (ML_MAX_DERP_REGIONS entries, trimmed after the
+ * session with ML_LITE_DERP_TRIM), a cached start (ML_LITE_CACHED_START)
+ * allocates the home region only. Needs ML_LITE_CONTEXT. */
+#ifndef ML_LITE_DERP_LAZY
+#define ML_LITE_DERP_LAZY ML_LITE_DEFAULT
+#endif
+
+/* ML_LITE_DERP_FRAME_CAP: the largest DERP frame payload that is read into
+ * memory. A relayed WireGuard/DISCO packet is at most 32 (key) + 1420 (MTU)
+ * + 32 (WireGuard overhead) bytes; DERP's own frames (ServerInfo, Ping,
+ * PeerGone, Health...) are smaller. Anything larger (the protocol allows
+ * 64 KB) is read and dropped in small pieces, never allocated. 0 = no cap. */
+#ifndef ML_LITE_DERP_FRAME_CAP
+#define ML_LITE_DERP_FRAME_CAP 4096
+#endif
+
+/* ML_LITE_RX_ONEBUF: relayed WireGuard packets are read straight into the
+ * lwIP pbuf that WireGuard decrypts in place (the MAC is checked first), and
+ * outgoing DERP packets are built once as [frame header | key | payload].
+ * Was: three copies on receive (frame, payload, pbuf) plus the plaintext
+ * pbuf, two on send. */
+#ifndef ML_LITE_RX_ONEBUF
+#define ML_LITE_RX_ONEBUF ML_LITE_DEFAULT
+#endif
+
+/* ML_LITE_SMALL_QUEUES: queue depths for one server peer over DERP
+ * (wg_rx 4, derp_tx 4, disco 1, peer_update 4). Needs ML_LITE_TASKS. */
+#ifndef ML_LITE_SMALL_QUEUES
+#define ML_LITE_SMALL_QUEUES 0
+#endif
+
+/* ML_LITE_NACL_CACHE_SLOTS: DISCO shared-key cache entries (nacl_box.c);
+ * one per peer is enough. 0 = the upstream 24. */
+#ifndef ML_LITE_NACL_CACHE_SLOTS
+#define ML_LITE_NACL_CACHE_SLOTS 0
+#endif

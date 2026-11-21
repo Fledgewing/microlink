@@ -7,6 +7,7 @@
  */
 
 #include "nacl_box.h"
+#include "ml_lite.h"   /* ML_LITE_NACL_CACHE_SLOTS */
 #include "x25519.h"
 #include <string.h>
 #include <stdbool.h>
@@ -456,7 +457,11 @@ int nacl_box_beforenm(uint8_t *shared_key,
  * active peers than slots, and a miss costs exactly what the old path did.
  * ------------------------------------------------------------------------- */
 
+#if ML_LITE_NACL_CACHE_SLOTS > 0
+#define NACL_SHARED_CACHE_SLOTS ML_LITE_NACL_CACHE_SLOTS
+#else
 #define NACL_SHARED_CACHE_SLOTS 24
+#endif
 
 static struct {
     uint8_t peer_pk[32];

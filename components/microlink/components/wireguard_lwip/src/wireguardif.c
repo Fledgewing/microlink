@@ -55,6 +55,19 @@
 
 #include <stdbool.h>
 
+/* ML_LITE_RX_ONEBUF (MicroLink lite): decrypt a transport data message in
+ * place in the pbuf it arrived in, which then carries the plaintext up the
+ * stack, instead of into a second pbuf. The MAC is verified before anything
+ * is decrypted (chacha20poly1305_decrypt), so a forged packet leaves the
+ * buffer untouched. Only for a single, contiguous pbuf; others take the
+ * copying path. */
+#if __has_include("ml_lite.h")
+#include "ml_lite.h"
+#endif
+#ifndef ML_LITE_RX_ONEBUF
+#define ML_LITE_RX_ONEBUF 0
+#endif
+
 /*
  * Locking. Packets are sent from tcpip_thread (netif output) and from the
  * wg_mgr task (keepalives, handshakes), received on wg_mgr (or on tcpip_thread
@@ -604,7 +617,7 @@ static bool peer_add_ip(struct wireguard_peer *peer, ip_addr_t ip, ip_addr_t mas
 	return result;
 }
 
-static void wireguardif_process_data_message(struct wireguard_device *device, struct wireguard_peer *peer, struct message_transport_data *data_hdr, size_t data_len, const ip_addr_t *addr, u16_t port) {
+static void wireguardif_process_data_message(struct wireguard_device *device, struct wireguard_peer *peer, struct message_transport_data *data_hdr, size_t data_len, const ip_addr_t *addr, u16_t port, struct pbuf *in) {
 	struct wireguard_keypair *keypair;
 	uint64_t nonce;
 	uint8_t *src;
@@ -628,14 +641,34 @@ static void wireguardif_process_data_message(struct wireguard_device *device, st
 			// not authenticated yet, so only drop this packet - never destroy the
 			// keypair on the strength of it.
 			pbuf = NULL;
+			bool in_place = false;
 			if (nonce < REJECT_AFTER_MESSAGES) {
-				// We don't know the unpadded size until we have decrypted the packet and validated/inspected the IP header
-				pbuf = pbuf_alloc(PBUF_TRANSPORT, src_len - WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
+#if ML_LITE_RX_ONEBUF
+				in_place = in && in->next == NULL && in->len == in->tot_len &&
+				           (in->type_internal & PBUF_TYPE_FLAG_STRUCT_DATA_CONTIGUOUS) != 0 &&
+				           (const uint8_t *)src == (const uint8_t *)in->payload + 16;
+#else
+				(void)in;
+#endif
+				if (!in_place) {
+					// We don't know the unpadded size until we have decrypted the packet and validated/inspected the IP header
+					pbuf = pbuf_alloc(PBUF_TRANSPORT, src_len - WIREGUARD_AUTHTAG_LEN, PBUF_RAM);
+				}
 			}
-			if (pbuf) {
-				// Decrypt the packet
-				memset(pbuf->payload, 0, pbuf->tot_len);
-				bool decrypt_ok = wireguard_decrypt_packet(pbuf->payload, src, src_len, nonce, keypair);
+			if (pbuf || in_place) {
+				// Decrypt the packet (in place: src is the plaintext's buffer)
+				bool decrypt_ok = wireguard_decrypt_packet(in_place ? src : pbuf->payload, src, src_len, nonce, keypair);
+				if (in_place) {
+					// The plaintext becomes the pbuf: drop the 16-byte message
+					// header and the tag, and hold a reference of our own (the
+					// caller frees its one after we return).
+					pbuf = in;
+					if (pbuf_remove_header(pbuf, 16) != 0) {
+						decrypt_ok = false;
+					}
+					pbuf_realloc(pbuf, (u16_t)(src_len - WIREGUARD_AUTHTAG_LEN));
+					pbuf_ref(pbuf);
+				}
 				WG_DEBUG("[WG_DECRYPT] result=%d, src_len=%u, nonce=%lu",
 				       decrypt_ok, (unsigned)src_len, (unsigned long)nonce);
 
@@ -1013,7 +1046,7 @@ void wireguardif_network_rx(void *arg, struct udp_pcb *pcb, struct pbuf *p, cons
 			peer = peer_lookup_by_receiver(device, msg_data->receiver);
 			if (peer) {
 				// header is 16 bytes long so take that off the length
-				wireguardif_process_data_message(device, peer, msg_data, len - 16, addr, port);
+				wireguardif_process_data_message(device, peer, msg_data, len - 16, addr, port, p);
 			}
 			break;
 

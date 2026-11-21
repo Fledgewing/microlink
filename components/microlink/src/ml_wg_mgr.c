@@ -2123,15 +2123,25 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
              pkt->len >= 4 ? pkt->data[0] : -1,
              pkt->src_pubkey[0], pkt->src_pubkey[1], pkt->src_pubkey[2], pkt->src_pubkey[3]);
     if (!ml->wg_netif) {
-        free(pkt->data);
+        ml_rx_packet_t drop = *pkt;
+        ml_rx_packet_release(&drop);
         return;
     }
 
     struct netif *netif = (struct netif *)ml->wg_netif;
     void *device = netif->state;
     if (!device) {
-        free(pkt->data);
+        ml_rx_packet_t drop = *pkt;
+        ml_rx_packet_release(&drop);
         return;
+    }
+
+    struct pbuf *p;
+    if (pkt->pbuf) {
+        /* ML_LITE_RX_ONEBUF: read off the relay straight into a PBUF_RAM
+         * pbuf, which wireguardif decrypts in place. */
+        p = (struct pbuf *)pkt->pbuf;
+        goto deliver;
     }
 
     /* Allocate PBUF_RAM and copy data so the pbuf OWNS its data.
@@ -2139,7 +2149,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
      * calls ip_input → tcpip_input which posts to the TCPIP thread.
      * With PBUF_REF the backing data would be freed before the TCPIP
      * thread processes the packet. */
-    struct pbuf *p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
+    p = pbuf_alloc(PBUF_RAW, pkt->len, PBUF_RAM);
     if (!p) {
         free(pkt->data);
         return;
@@ -2147,6 +2157,7 @@ static void process_wg_packet(microlink_t *ml, const ml_rx_packet_t *pkt) {
     pbuf_take(p, pkt->data, pkt->len);
     free(pkt->data);  /* Original data no longer needed — pbuf has its own copy */
 
+deliver:;
     /* Build source address */
     ip_addr_t addr;
     if (pkt->via_derp) {
@@ -2504,7 +2515,9 @@ static void wg_mgr_begin(microlink_t *ml) {
     disco_probe_start_idx = 0;
 
     /* Load cached peers from NVS for fast boot */
-    int cached = ml_peer_nvs_load_all(ml->peers, ML_MAX_PEERS);
+    int cached = ml_peer_nvs_load_all(ml->peers, ML_MAX_PEERS,
+                                      ml->cached_start_peer ? ml->cached_start_peer
+                                                            : ml->config.priority_peer_ip);
     if (cached > 0) {
         ml->peer_count = cached;
         ESP_LOGI(TAG, "Pre-loaded %d cached peers from NVS", cached);

@@ -124,16 +124,28 @@ extern "C" {
  * and drains them in the same pass, and it drains peer updates from the
  * start (not only after registration), so these only need to cover a burst.
  * DERP TX is filled by WireGuard output on the tcpip thread. */
+#if ML_LITE_SMALL_QUEUES
+/* One server peer over DERP: a pass reads at most 4 frames and drains them;
+ * the first netmap's peers are taken as they are queued. */
+#define ML_DERP_TX_QUEUE_DEPTH  4
+#define ML_WG_RX_QUEUE_DEPTH    4
+#define ML_PEER_UPDATE_QUEUE_DEPTH 4
+#else
 #define ML_DERP_TX_QUEUE_DEPTH  8
 #define ML_WG_RX_QUEUE_DEPTH    8
 #define ML_PEER_UPDATE_QUEUE_DEPTH 32
+#endif
 #else
 #define ML_DERP_TX_QUEUE_DEPTH  16
 #endif
 #if ML_LITE_NO_DIRECT
 /* DISCO only arrives over DERP (pings from peers); no STUN replies at all,
  * but coord still reads the queue, so it exists. */
+#if ML_LITE_SMALL_QUEUES && ML_LITE_TASKS
+#define ML_DISCO_RX_QUEUE_DEPTH 1
+#else
 #define ML_DISCO_RX_QUEUE_DEPTH 4
+#endif
 #define ML_STUN_RX_QUEUE_DEPTH  1
 #else
 #define ML_DISCO_RX_QUEUE_DEPTH 16
@@ -321,6 +333,8 @@ typedef struct {
     size_t len;                 /* Payload length */
     uint8_t frame_type;         /* DERP frame type (0x04 = SendPacket) */
     uint16_t region;            /* relay region to send through (0 = home) */
+    bool framed;                /* ML_LITE_RX_ONEBUF: data = [5-byte DERP header | dest key | payload],
+                                 * written as one; len is still the payload length */
 } ml_derp_tx_item_t;
 
 /* Received packet (from net_io to disco/wg queues) */
@@ -331,7 +345,12 @@ typedef struct {
     uint16_t src_port;          /* Source port (for UDP packets) */
     uint8_t src_pubkey[32];     /* Source peer key (for DERP packets) */
     bool via_derp;              /* true if received via DERP, false if direct UDP */
+    void *pbuf;                 /* ML_LITE_RX_ONEBUF: the lwIP pbuf holding data (data points
+                                 * into it; release with ml_rx_packet_release), NULL = data is malloc'd */
 } ml_rx_packet_t;
+
+/* Free a received packet's buffer (heap data or its pbuf). ml_derp.c */
+void ml_rx_packet_release(ml_rx_packet_t *pkt);
 
 /* Coordination command */
 typedef enum {
@@ -708,6 +727,15 @@ struct microlink_s {
     int64_t key_expiry_epoch;       /* Unix epoch seconds, 0 = no expiry */
     bool key_expired;               /* true if Node.Expired == true */
 
+    /* Entries allocated in derp_regions (ML_LITE_CONTEXT; 0 = none yet) */
+    uint8_t derp_region_cap;
+
+    /* Start from cached control state (ML_LITE_CACHED_START, ml_coord.c) */
+    uint32_t cached_start_peer;     /* host: peer the cache must hold (0 = no cached start) */
+    bool cached_auto_fallback;      /* host: run a control session by itself if the cache fails */
+    bool cached_run;                /* this run started from the cache, no session yet */
+    bool connected_on_derp;         /* report CONNECTED once the home relay is up */
+
     /* Resolved timing (set during init from config, 0 = default) */
     uint32_t t_disco_heartbeat_ms;
     uint32_t t_stun_interval_ms;
@@ -928,13 +956,25 @@ int ml_h2_build_window_update(uint8_t *out, size_t out_size,
 esp_err_t ml_peer_nvs_init(void);
 void ml_peer_nvs_deinit(void);
 esp_err_t ml_peer_nvs_save(const ml_peer_t *peer);
-int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers);
+/* Loads first_ip's entry first when it is cached (0 = table order). */
+int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers, uint32_t first_ip);
 esp_err_t ml_peer_nvs_clear(void);
 esp_err_t ml_peer_nvs_remove(const uint8_t *public_key);
+/* True if the peer cache holds a peer with this VPN IP. */
+bool ml_peer_nvs_has(uint32_t vpn_ip);
 /* Defer the flash writes of saves/removes until the matching batch_end()
  * (nestable), so a batch costs at most one write. wg_mgr task only. */
 void ml_peer_nvs_batch_begin(void);
 void ml_peer_nvs_batch_end(void);
+
+/* ml_coord.c (ML_LITE_CACHED_START): start from the cached control state if
+ * it is valid. True: the run needs no coord task (DERP connect requested,
+ * COORD_REGISTERED set). Called by microlink_start() before the tasks. */
+bool ml_ctl_cache_try_start(microlink_t *ml);
+/* The home relay is up (or its connect failed): report CONNECTED if the run
+ * waits for it, and fall back to a control session when a cached start's
+ * relay cannot be reached. Tunnel/DERP task. */
+void ml_ctl_derp_result(microlink_t *ml, bool connected);
 
 #ifdef CONFIG_ML_ZERO_COPY_WG
 /* ml_zerocopy.c */

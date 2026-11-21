@@ -271,7 +271,7 @@ static void ml_drain_queues(microlink_t *ml) {
     QueueHandle_t rxq[] = { ml->disco_rx_queue, ml->wg_rx_queue, ml->stun_rx_queue };
     for (size_t i = 0; i < sizeof(rxq) / sizeof(rxq[0]); i++) {
         if (!rxq[i]) continue;
-        while (xQueueReceive(rxq[i], &pkt, 0) == pdTRUE) { free(pkt.data); dropped++; }
+        while (xQueueReceive(rxq[i], &pkt, 0) == pdTRUE) { ml_rx_packet_release(&pkt); dropped++; }
     }
     if (ml->derp_tx_queue) {
         ml_derp_tx_item_t item;
@@ -446,7 +446,13 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         ESP_LOGE(TAG, "Failed to allocate context (%u bytes)", (unsigned)sizeof(microlink_t));
         return NULL;
     }
-#if ML_LITE_CONTEXT
+#if ML_LITE_CONTEXT && ML_LITE_DERP_LAZY
+    /* The region table comes with the first DERPMap, or holds only the home
+     * region on a cached start (ml_coord.c). */
+    ml->derp_regions = NULL;
+    ml->derp_region_cap = 0;
+    ESP_LOGI(TAG, "Lite context: %u bytes (DERP region table on demand)", (unsigned)sizeof(microlink_t));
+#elif ML_LITE_CONTEXT
     ml->derp_regions = ml_psram_calloc(ML_MAX_DERP_REGIONS, sizeof(ml_derp_region_t));
     if (!ml->derp_regions) {
         ESP_LOGE(TAG, "Failed to allocate DERP region table (%u bytes)",
@@ -454,6 +460,7 @@ microlink_t *microlink_init(const microlink_config_t *config) {
         free(ml);
         return NULL;
     }
+    ml->derp_region_cap = ML_MAX_DERP_REGIONS;
     ESP_LOGI(TAG, "Lite context: %u bytes + DERP regions %u bytes",
              (unsigned)sizeof(microlink_t),
              (unsigned)(ML_MAX_DERP_REGIONS * sizeof(ml_derp_region_t)));
@@ -682,6 +689,11 @@ esp_err_t microlink_start(microlink_t *ml) {
      * COORD_REGISTERED/WG_READY/DERP_* bits would skip startup steps. */
     xEventGroupClearBits(ml->events, ML_EVT_ALL_BITS);
     ml->started = true;
+    ml->cached_run = false;
+    ml->connected_on_derp = false;
+    /* ML_LITE_CACHED_START: no control session when the cached state is good
+     * (ml_coord.c); before the tasks, which read what it restores. */
+    const bool cached = ml_ctl_cache_try_start(ml);
 
     /* First boot of an OTA-updated firmware: arm its rollback timer */
     ml_ota_check_pending();
@@ -798,6 +810,10 @@ skip_bsd_socket:
                    "one handle per task");
 
     for (size_t i = 0; i < sizeof(tasks) / sizeof(tasks[0]); i++) {
+        if (cached && tasks[i].bit == ML_TASK_BIT_COORD) {
+            *handles[i] = NULL;   /* microlink_control_refresh() starts one if needed */
+            continue;
+        }
         __atomic_fetch_or(&ml->tasks_alive, tasks[i].bit, __ATOMIC_RELEASE);
         if (xTaskCreatePinnedToCore(tasks[i].fn, tasks[i].name, tasks[i].stack, ml,
                                     tasks[i].prio, handles[i], tasks[i].core) != pdPASS) {
@@ -816,9 +832,16 @@ skip_bsd_socket:
      * Signal the event so coord/wg_mgr tasks proceed immediately. */
     xEventGroupSetBits(ml->events, ML_EVT_WIFI_CONNECTED);
 
-    /* Signal coord task to start connecting */
-    ml_coord_cmd_t cmd = ML_CMD_CONNECT;
-    xQueueSend(ml->coord_cmd_queue, &cmd, 0);
+    if (cached) {
+        /* The cached peers go into WireGuard (COORD_REGISTERED) and the
+         * cached home relay connects; CONNECTED follows once it is up. */
+        ml->state = ML_STATE_CONNECTING;
+        xEventGroupSetBits(ml->events, ML_EVT_COORD_REGISTERED | ML_EVT_DERP_CONNECT_REQ);
+    } else {
+        /* Signal coord task to start connecting */
+        ml_coord_cmd_t cmd = ML_CMD_CONNECT;
+        xQueueSend(ml->coord_cmd_queue, &cmd, 0);
+    }
 
     /* Start HTTP config server (binds port 80, serves config page + REST API) */
     if (ml->config_httpd) {

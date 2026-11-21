@@ -274,6 +274,24 @@ uint32_t microlink_control_sessions(void);
 void microlink_control_register_only(bool on);
 
 /**
+ * Skip the control session at start when the state the last one left is
+ * still good (ML_LITE_CACHED_START): our node key not within ~2 days of its
+ * expiry, our VPN IP, the home relay we reported, and `vpn_ip` in the peer
+ * cache. Set before microlink_start(); 0 turns the cached start off.
+ * auto_fallback: when the cached relay cannot be reached, start a control
+ * session on its own (false: report it, invalidate the cache, and leave the
+ * next step to the host, e.g. while it cannot spare a session's memory).
+ */
+void microlink_cached_start_peer(microlink_t *ml, uint32_t vpn_ip, bool auto_fallback);
+
+/** True while this run is on cached control state (no session has run yet). */
+bool microlink_control_cached(const microlink_t *ml);
+
+/** The cached state did not work (e.g. no WireGuard handshake): the next
+ *  start runs a full control session. */
+void microlink_control_cache_invalidate(const char *reason);
+
+/**
  * @brief Your own lwIP IPv6 input hook, when MicroLink forwards IPv6
  *
  * With CONFIG_ML_ROUTER_IPV6, MicroLink implements lwIP's

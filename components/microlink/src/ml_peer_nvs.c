@@ -268,12 +268,21 @@ esp_err_t ml_peer_nvs_save(const ml_peer_t *peer) {
     return err;
 }
 
-int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers) {
+int ml_peer_nvs_load_all(ml_peer_t *peers, int max_peers, uint32_t first_ip) {
     if (!s_initialized || !peers || !s_table) return 0;
     if (s_table->count == 0) return 0;
 
+    /* The entry for first_ip (if cached) goes first, so a table smaller than
+     * the cache still gets the peer the host needs (ML_LITE_CACHED_START). */
+    int first = -1;
+    for (int i = 0; first_ip && i < s_table->count; i++) {
+        if (s_table->entries[i].vpn_ip == first_ip) first = i;
+    }
+
     int loaded = 0;
-    for (int i = 0; i < s_table->count && loaded < max_peers; i++) {
+    for (int n = -1; n < s_table->count && loaded < max_peers; n++) {
+        int i = n < 0 ? first : n;
+        if (i < 0 || (n >= 0 && i == first)) continue;
         peer_nvs_entry_t *entry = &s_table->entries[i];
         if (entry->vpn_ip == 0) continue;
 
@@ -341,4 +350,12 @@ esp_err_t ml_peer_nvs_clear(void) {
         ESP_LOGI(TAG, "Peer NVS cleared");
     }
     return err;
+}
+
+bool ml_peer_nvs_has(uint32_t vpn_ip) {
+    if (!s_initialized || !s_table || vpn_ip == 0) return false;
+    for (int i = 0; i < s_table->count; i++) {
+        if (s_table->entries[i].vpn_ip == vpn_ip) return true;
+    }
+    return false;
 }
