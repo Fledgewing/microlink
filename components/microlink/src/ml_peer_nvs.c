@@ -28,7 +28,12 @@ static const char *TAG = "ml_peer_nvs";
 
 #define PEER_NVS_NAMESPACE  "ml_peers"
 #define PEER_NVS_BLOB_KEY   "tbl"
-#ifdef CONFIG_ML_NVS_MAX_PEERS
+#if ML_LITE_CONTEXT
+/* Room for the peers a lite client tracks plus two: the table is kept in
+ * RAM for the life of the context. An existing larger cache does not fit
+ * the smaller read and is started afresh once. */
+#define ML_NVS_MAX_PEERS    (ML_MAX_PEERS + 2)
+#elif defined(CONFIG_ML_NVS_MAX_PEERS)
 #define ML_NVS_MAX_PEERS    CONFIG_ML_NVS_MAX_PEERS
 #else
 #define ML_NVS_MAX_PEERS    64  /* Fallback default */

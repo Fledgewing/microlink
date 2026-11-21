@@ -42,7 +42,15 @@
 /* Follow MicroLink's peer-table size so every tracked peer can get a tunnel
  * (it used to be fixed at 16 while CONFIG_ML_MAX_PEERS allowed up to 64). */
 #include "sdkconfig.h"
-#if defined(CONFIG_ML_MAX_PEERS) && CONFIG_ML_MAX_PEERS > 16
+#if __has_include("ml_lite.h")
+#include "ml_lite.h"
+#endif
+#if defined(ML_LITE_CONTEXT) && ML_LITE_CONTEXT
+/* MicroLink's small-memory mode tracks only ML_LITE_MAX_PEERS peers; at
+ * ~0.9 KB a peer, the 16-peer floor below would make the device one ~15 KB
+ * block of internal RAM. */
+#define WIREGUARD_MAX_PEERS ML_LITE_MAX_PEERS
+#elif defined(CONFIG_ML_MAX_PEERS) && CONFIG_ML_MAX_PEERS > 16
 #define WIREGUARD_MAX_PEERS CONFIG_ML_MAX_PEERS
 #else
 #define WIREGUARD_MAX_PEERS 16

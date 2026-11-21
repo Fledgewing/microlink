@@ -146,6 +146,12 @@ static esp_err_t ensure_stun_socket(microlink_t *ml) {
  * ========================================================================== */
 
 esp_err_t ml_stun_resolve_servers(microlink_t *ml) {
+#if ML_LITE_NO_DIRECT
+    /* DERP only: no endpoint discovery. With no server address the coord
+     * task's probes and retries below all become no-ops. */
+    (void)ml;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     struct addrinfo *res = NULL;
 
     /* Determine primary STUN host — use parsed DERPMap home region if available */
@@ -246,6 +252,10 @@ esp_err_t ml_stun_resolve_servers(microlink_t *ml) {
  * ========================================================================== */
 
 esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port) {
+#if ML_LITE_NO_DIRECT
+    (void)ml; (void)server; (void)port;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     /* Resolve STUN server — accept either IPv4 or IPv6 */
     struct addrinfo hints = { .ai_family = AF_UNSPEC, .ai_socktype = SOCK_DGRAM };
     struct addrinfo *res = NULL;
@@ -310,6 +320,10 @@ esp_err_t ml_stun_send_probe(microlink_t *ml, const char *server, uint16_t port)
  * ========================================================================== */
 
 esp_err_t ml_stun_send_probe_to(microlink_t *ml, uint32_t server_ip, uint16_t port) {
+#if ML_LITE_NO_DIRECT
+    (void)ml; (void)server_ip; (void)port;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     if (server_ip == 0) return ESP_ERR_INVALID_ARG;
 
     /* Use disco_sock4 for STUN probes so the NAT mapping (external IP:port)
@@ -493,6 +507,10 @@ static esp_err_t ensure_stun_socket6(microlink_t *ml) {
 }
 
 esp_err_t ml_stun_send_probe_ipv6(microlink_t *ml, const uint8_t *server_ip6, uint16_t port) {
+#if ML_LITE_NO_DIRECT
+    (void)ml; (void)server_ip6; (void)port;
+    return ESP_ERR_NOT_SUPPORTED;
+#endif
     /* Check for zero address */
     static const uint8_t zero16[16] = {0};
     if (memcmp(server_ip6, zero16, 16) == 0) return ESP_ERR_INVALID_ARG;
@@ -611,6 +629,16 @@ bool ml_stun_parse_response_ipv6(const uint8_t *data, size_t len,
 #define DERP_PROBE_ROUND_MS   500
 #define DERP_PROBE_TOTAL_MS   1500
 
+typedef struct {
+    uint32_t ip;
+    uint16_t port;
+    uint8_t txid[2][12];
+    uint64_t sent_ms[2];
+    uint32_t rtt_ms;       /* 0 = no answer */
+} region_probe_t;
+
+static void derp_pick_region_probe(microlink_t *ml, region_probe_t *probe);
+
 void ml_derp_pick_region(microlink_t *ml) {
     if (ml->derp_forced_region) {
         ml->derp_preferred_region = ml->derp_forced_region;
@@ -618,18 +646,27 @@ void ml_derp_pick_region(microlink_t *ml) {
         ESP_LOGI(TAG, "Home DERP region %d (set by host; not probing)", ml->derp_forced_region);
         return;
     }
-    const int n = ml->derp_region_count;
-    if (n <= 0) return;
+    if (ml->derp_region_count <= 0) return;
 
+#if ML_LITE_CONTEXT
+    /* ~1.8 KB for the ~1.5 s of the probe, not for the life of the program */
+    region_probe_t *probe = calloc(ML_MAX_DERP_REGIONS, sizeof(region_probe_t));
+    if (!probe) {
+        ESP_LOGW(TAG, "Region probe: out of memory; keeping region %d", ml->derp_home_region);
+        return;
+    }
+    derp_pick_region_probe(ml, probe);
+    free(probe);
+#else
     /* static: ~1.8 KB, and only the coord task calls this */
-    static struct {
-        uint32_t ip;
-        uint16_t port;
-        uint8_t txid[2][12];
-        uint64_t sent_ms[2];
-        uint32_t rtt_ms;       /* 0 = no answer */
-    } probe[ML_MAX_DERP_REGIONS];
+    static region_probe_t probe[ML_MAX_DERP_REGIONS];
     memset(probe, 0, sizeof(probe));
+    derp_pick_region_probe(ml, probe);
+#endif
+}
+
+static void derp_pick_region_probe(microlink_t *ml, region_probe_t *probe) {
+    const int n = ml->derp_region_count;
 
     int usable = 0;
     for (int i = 0; i < n; i++) {
