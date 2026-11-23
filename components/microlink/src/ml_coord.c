@@ -2380,6 +2380,16 @@ static int send_map_request(microlink_t *ml, ml_noise_state_t *noise) {
     return 0;
 }
 
+/* The first reply to the Stream=false MapRequest normally arrives in 1-2.5 s
+ * (24-31 KB netmaps). Once in a while the control plane accepts the request
+ * and never answers it on that connection: an X4 Pro waited 22 s with zero
+ * bytes while a sync gave up on Tailscale after 20 s. Past this much silence
+ * the request is sent again on a new connection; once data flows, the
+ * 60 s budget for a large netmap applies. */
+#define MAP_FIRST_REPLY_MS 10000
+/* do_fetch_peers(): no byte of the reply within MAP_FIRST_REPLY_MS. */
+#define MAP_NO_REPLY (-3)
+
 static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     int64_t t_map_start = esp_timer_get_time();
 
@@ -2403,8 +2413,9 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
     uint8_t *resp_buf = h2_recv;
     size_t json_total = 0;
 
-    /* Set extended recv timeout for large MapResponse (60 seconds) */
-    coord_set_rcv_timeout(ml, 60000);
+    /* Until the first byte: MAP_FIRST_REPLY_MS. Then the extended timeout for a
+     * large MapResponse (60 seconds). */
+    coord_set_rcv_timeout(ml, MAP_FIRST_REPLY_MS);
 
     uint64_t recv_start_ms = ml_get_time_ms();
     uint64_t last_progress_ms = recv_start_ms;
@@ -2419,6 +2430,18 @@ static int do_fetch_peers(microlink_t *ml, ml_noise_state_t *noise) {
         /* Decrypt straight into h2_recv (no per-frame 64KB scratch buffer) */
         size_t space = ML_H2_BUFFER_SIZE - h2_total;
         int frame_len = noise_recv(ml, noise, h2_recv + h2_total, space);
+        if (frame_len < 0 && h2_total == 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            ESP_LOGW(TAG, "MapResponse: no reply in %d ms; sending the MapRequest again on a new connection",
+                     MAP_FIRST_REPLY_MS);
+            coord_set_rcv_timeout(ml, 5000);
+            free(h2_recv);
+            return MAP_NO_REPLY;
+        }
+        if (h2_total == 0 && frame_len > 0) {
+            ESP_LOGI(TAG, "[TIMING] MapResponse first reply: %lu ms",
+                     (unsigned long)(ml_get_time_ms() - recv_start_ms));
+            coord_set_rcv_timeout(ml, 60000);
+        }
         if (frame_len <= 0) {
             if (frame_len < 0 && space < 65536) {
                 ESP_LOGW(TAG, "H2 buffer full at %dKB, truncating", (int)(h2_total / 1024));
@@ -4030,6 +4053,8 @@ void ml_coord_task(void *arg) {
     ml_coord_cmd_t cmd;
     uint64_t last_activity_ms = ml_get_time_ms();
     int reconnect_attempts = 0;
+    /* Stream=false MapRequests in a row that got no reply (MAP_NO_REPLY). */
+    int map_no_reply = 0;
 
     /* Noise protocol state - owned exclusively by this task */
     ml_noise_state_t noise = {0};
@@ -4275,6 +4300,18 @@ void ml_coord_task(void *arg) {
 #else
                 int fr = do_fetch_peers(ml, &noise);
 #endif
+                if (fr == MAP_NO_REPLY && ++map_no_reply < 2) {
+                    /* Once on a new connection, at once; a second silence
+                     * takes the streaming fetch below (as a server that
+                     * ignores Stream=false would). */
+                    ESP_LOGW(TAG, "MapRequest retry %d: reconnecting now", map_no_reply);
+                    coord_close_conn(ml);
+                    reconnect_attempts = 0;
+                    state = COORD_RECONNECTING;
+                    break;
+                }
+                if (fr == MAP_NO_REPLY) fr = -2;
+                map_no_reply = 0;
                 if (fr == -2) {
                     /* Headscale-style servers send no netmap for Stream=false.
                      * Switch to the streaming initial fetch (as the official
